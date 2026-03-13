@@ -20,6 +20,8 @@ struct ExpertAndOffset {
     float weight;
 };
 
+static_assert(sizeof(ExpertAndOffset) == 16, "dispatch route trailer must stay 16 bytes");
+
 
 /// Wrapper class to efficiently access the expert indices and offsets.
 template<typename NumExpertsPerTokenTy>
@@ -310,6 +312,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                                 if (has_scale) {
                                     *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
                                 }
+                                if (i == 0) {
+                                    *((ExpertAndOffset*)(token_ptr + token_stride - sizeof(ExpertAndOffset))) = route;
+                                }
                             }
                         } else {
                             // Always write into the send buffer for local copies.
@@ -318,6 +323,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                             st_global_nc_uint4(&x_token_dst[i], val);
                             if (has_scale) {
                                 *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
+                            }
+                            if (i == 0) {
+                                *((ExpertAndOffset*)(token_ptr + token_stride - sizeof(ExpertAndOffset))) = route;
                             }
                         }
                     }
@@ -364,6 +372,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                             if (has_scale) {
                                 *((float*)(token_ptr + token_dim_bound) + i) = scales[s];
                             }
+                            if (i == 0) {
+                                *((ExpertAndOffset*)(token_ptr + token_stride - sizeof(ExpertAndOffset))) = route;
+                            }
                         }
                     }
                 }
@@ -397,6 +408,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                             st_global_nc_uint4(&x_token_dst[i], vals[s]);
                             if (has_scale) {
                                 *((float*)(token_ptr + token_dim_bound) + i) = scales[s];
+                            }
+                            if (i == 0) {
+                                *((ExpertAndOffset*)(token_ptr + token_stride - sizeof(ExpertAndOffset))) = route;
                             }
                         }
                     }
@@ -454,6 +468,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         st_global_nc_uint4(&x_token_dst[i], val);
                         if (has_scale) {
                             *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
+                        }
+                        if (i == 0) {
+                            *((ExpertAndOffset*)(token_ptr + token_stride - sizeof(ExpertAndOffset))) = route;
                         }
                     }
                 }
@@ -513,6 +530,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                                 st_global_nc_uint4(&x_token_dst[i], val);
                                 if (has_scale) {
                                     *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
+                                }
+                                if (i == 0) {
+                                    *((ExpertAndOffset*)(token_ptr + token_stride - sizeof(ExpertAndOffset))) = route;
                                 }
                             }
                         }
@@ -585,6 +605,7 @@ int a2a_kernels::a2a_dispatch_send(
 
     const size_t token_dim = round_up<size_t>(hidden_dim * x_elemsize, sizeof(int4));
     const size_t token_scale_dim = round_up<size_t>(hidden_dim_scale * x_scale_elemsize, sizeof(int4));
+    // Reserve a 16-byte trailer on every routed token slot for dispatch metadata.
     const size_t token_stride = token_dim + token_scale_dim + 16;
     assert(token_stride % sizeof(int4) == 0);
 

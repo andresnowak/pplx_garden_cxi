@@ -13,6 +13,15 @@
 using namespace rose;
 using namespace rose::device;
 
+struct ExpertAndOffset {
+    uint32_t expert;
+    uint32_t offset;
+    uint32_t position;
+    float weight;
+};
+
+static_assert(sizeof(ExpertAndOffset) == 16, "dispatch route trailer must stay 16 bytes");
+
 template<unsigned NUM_WARPS, unsigned NODE_SIZE, typename TokenDimTy, typename HiddenDimScaleTy>
 __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1)
 void a2a_dispatch_recv_kernel(
@@ -29,6 +38,7 @@ void a2a_dispatch_recv_kernel(
     int32_t * __restrict__ out_num_tokens_ptr,
     std::byte * __restrict__ out_x_ptr,
     size_t out_x_stride,
+    float * __restrict__ out_prob_ptr,
     float * __restrict__ out_x_scale_ptr,
     size_t out_x_scale_stride_elem,
     size_t out_x_scale_stride_token,
@@ -127,6 +137,7 @@ void a2a_dispatch_recv_kernel(
         auto local_rank = token_rank % NODE_SIZE;
         auto position = source_offset[token];
         uint4 *x_token_src;
+        ExpertAndOffset *meta_src;
         if (token_rank == rank) {
             x_token_src = (uint4*)(send_buffer + position * token_stride);
         } else if (position & (1u << 31)) {
@@ -134,6 +145,7 @@ void a2a_dispatch_recv_kernel(
         } else {
             x_token_src = (uint4*)(recv_buffer + position * token_stride);
         }
+        meta_src = (ExpertAndOffset*)((std::byte*)x_token_src + token_stride - sizeof(ExpertAndOffset));
 
         // Token originates from the local node - copy it from an NVLink buffer.
         uint4 *x_token_dst = (uint4*)(out_x_ptr + padded_token * out_x_stride);
@@ -152,6 +164,9 @@ void a2a_dispatch_recv_kernel(
             if (has_scale) {
                 x_scale_dst[i * out_x_scale_stride_elem] = scale;
             }
+        }
+        if (threadIdx.x == 0 && out_prob_ptr) {
+            out_prob_ptr[padded_token] = meta_src->weight;
         }
     }
 
@@ -196,6 +211,8 @@ void a2a_dispatch_recv_kernel(
             uint4 *x_token_dst = local_stage[s].x_token_dst;
             float *x_scale_dst = local_stage[s].x_scale_dst;
             float *x_scale_src = local_stage[s].x_scale_src;
+            ExpertAndOffset *meta_src = (ExpertAndOffset*)((std::byte*)x_token_src + token_stride - sizeof(ExpertAndOffset));
+            uint32_t padded_token = shared_stage[s].dst_index;
 
             for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += blockDim.x) {
                 const bool has_scale = out_x_scale_ptr && i < hidden_dim_scale_bound;
@@ -208,6 +225,9 @@ void a2a_dispatch_recv_kernel(
                 if (has_scale) {
                     x_scale_dst[i * out_x_scale_stride_elem] = scale;
                 }
+            }
+            if (threadIdx.x == 0 && out_prob_ptr) {
+                out_prob_ptr[padded_token] = meta_src->weight;
             }
 
             token += gridDim.x;
@@ -249,6 +269,7 @@ int a2a_kernels::a2a_dispatch_recv(
     int32_t *out_num_tokens_ptr,
     uint8_t *out_x_ptr,
     size_t out_x_stride,
+    float *out_prob_ptr,
     uint8_t *out_x_scale_ptr,
     size_t out_x_scale_stride_elem,
     size_t out_x_scale_stride_token,
@@ -276,6 +297,7 @@ int a2a_kernels::a2a_dispatch_recv(
 
     const size_t token_dim = round_up<size_t>(hidden_dim * x_elemsize, sizeof(float4));
     const size_t token_scale_dim = round_up<size_t>(hidden_dim_scale * x_scale_elemsize, sizeof(float4));
+    // Match the 16-byte dispatch metadata trailer added by dispatch_send.
     const size_t token_stride = token_dim + token_scale_dim + 16;
     assert(token_stride % sizeof(float4) == 0);
 
@@ -293,6 +315,7 @@ int a2a_kernels::a2a_dispatch_recv(
         &out_num_tokens_ptr,
         &out_x_ptr,
         &out_x_stride,
+        &out_prob_ptr,
         &out_x_scale_ptr,
         &out_x_scale_stride_elem,
         &out_x_scale_stride_token,

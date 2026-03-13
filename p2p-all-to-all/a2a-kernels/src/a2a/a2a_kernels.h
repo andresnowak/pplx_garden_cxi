@@ -65,6 +65,7 @@ int a2a_dispatch_recv(
     int32_t *out_num_tokens_ptr,
     uint8_t *out_x_ptr,
     size_t out_x_stride,
+    float *out_prob_ptr,
     uint8_t *out_x_scale_ptr,
     size_t out_x_scale_stride_elem,
     size_t out_x_scale_stride_token,

@@ -155,6 +155,8 @@ class P2PAllToAll(AllToAllKernel):
         )
 
         # Allocate a a buffer to send from.
+        # Dispatch uses an extra 16-byte trailer per routed token slot. The CUDA kernels use
+        # that trailer for per-route metadata while keeping the payload 16-byte aligned.
         token_dim_dispatch = round_up(hidden_dim * in_dtype.itemsize, 16) + 16
         if hidden_dim_scale is not None or scale_dtype is not None:
             assert scale_dtype is not None
@@ -327,6 +329,7 @@ class P2PAllToAll(AllToAllKernel):
         bound_m: Optional[torch.Tensor] = None,
         do_send: bool = True,
         do_recv: bool = True,
+        out_expert_prob: Optional[torch.Tensor] = None,
     ) -> None:
         assert self._all_to_all is not None
         assert do_send or do_recv
@@ -346,6 +349,15 @@ class P2PAllToAll(AllToAllKernel):
         assert out_expert_x.dtype == self._in_dtype
         out_x_ptr = out_expert_x.data_ptr()
         out_x_stride = out_expert_x.stride(0) * out_expert_x.dtype.itemsize
+
+        out_prob_ptr: Optional[int]
+        if out_expert_prob is not None:
+            assert out_expert_prob.shape == (num_expert_tokens,)
+            assert out_expert_prob.stride(0) == 1
+            assert out_expert_prob.dtype == torch.float32
+            out_prob_ptr = out_expert_prob.data_ptr()
+        else:
+            out_prob_ptr = None
 
         # Verify the output scale buffer.
         out_x_scale_ptr: Optional[int]
@@ -433,6 +445,7 @@ class P2PAllToAll(AllToAllKernel):
                 out_num_tokens_ptr=out_expert_num_tokens_ptr,
                 out_x_ptr=out_x_ptr,
                 out_x_stride=out_x_stride,
+                out_prob_ptr=out_prob_ptr,
                 out_x_scale_ptr=out_x_scale_ptr,
                 out_x_scale_stride_elem=out_x_scale_stride_elem,
                 out_x_scale_stride_token=out_x_scale_stride_token,

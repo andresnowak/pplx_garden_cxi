@@ -16,6 +16,7 @@ class AllToAllKernel(Protocol):
         bound_m: Optional[torch.Tensor] = None,
         do_send: bool = True,
         do_recv: bool = True,
+        out_expert_prob: Optional[torch.Tensor] = None,
     ) -> None: ...
 
     def combine(

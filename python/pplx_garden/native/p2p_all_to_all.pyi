@@ -70,6 +70,7 @@ class AllToAllContext:
         out_num_tokens_ptr: int,
         out_x_ptr: int,
         out_x_stride: int,
+        out_prob_ptr: int | None,
         out_x_scale_ptr: int | None,
         out_x_scale_stride_elem: int | None,
         out_x_scale_stride_token: int | None,

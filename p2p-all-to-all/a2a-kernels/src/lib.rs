@@ -59,6 +59,7 @@ mod ffi {
             out_num_tokens_ptr: *mut i32,
             out_x_ptr: *mut u8,
             out_x_stride: usize,
+            out_prob_ptr: *mut f32,
             out_x_scale_ptr: *mut u8,
             out_x_scale_stride_elem: usize,
             out_x_scale_stride_token: usize,

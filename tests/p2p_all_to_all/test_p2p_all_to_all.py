@@ -1,3 +1,4 @@
+from collections import Counter
 from dataclasses import dataclass
 from typing import Optional
 
@@ -151,6 +152,11 @@ def _test_p2p_all_to_all_worker(
             dtype=in_dtype,
             device=device,
         )
+        out_expert_prob = torch.empty(
+            (max_recv_tokens,),
+            dtype=torch.float32,
+            device=device,
+        )
         out_tokens = torch.empty(
             (max_num_tokens, hidden_dim),
             dtype=out_dtype,
@@ -178,6 +184,7 @@ def _test_p2p_all_to_all_worker(
             indices=local_rank.indices,
             weights=local_rank.weights,
             bound_m=None,
+            out_expert_prob=out_expert_prob,
         )
         expert_y = _act(out_expert_x, out_expert_x_scale).to(out_dtype)
         all_to_all.combine(
@@ -211,8 +218,8 @@ def _test_p2p_all_to_all_worker(
         logger.info("Stopping all-to-all")
         all_to_all.destroy()
 
-    # Verify the tokens on the rank.
-    num_missing = 0
+        # Verify the tokens on the rank.
+        num_missing = 0
     for i, (token, routes) in enumerate(
         zip(list(local_rank.dp_x), local_rank.indices.tolist())
     ):
@@ -229,6 +236,33 @@ def _test_p2p_all_to_all_worker(
                 ", ".join(str(route) for route in routes),
             )
     assert num_missing == 0, f"Missing {num_missing} tokens on rank {dp_rank}"
+
+    # Verify routed probabilities align with the dispatched tokens.
+    def hash_prob(prob: float) -> str:
+        return f"{prob:.6f}"
+
+    expected_token_probs = Counter()
+    for rank in rank_data:
+        for token, routes, weights in zip(
+            rank.dp_x.tolist(), rank.indices.tolist(), rank.weights.tolist()
+        ):
+            token_key = hash_token(torch.tensor(token))
+            for route, weight in zip(routes, weights):
+                if first_expert <= route < last_expert:
+                    expected_token_probs[(token_key, hash_prob(weight))] += 1
+
+    received_token_probs = Counter()
+    index = 0
+    for n in expected_local_tokens.tolist():
+        for token, prob in zip(
+            out_expert_x[index : index + n], out_expert_prob[index : index + n]
+        ):
+            received_token_probs[
+                (hash_token(token), hash_prob(float(prob.item())))
+            ] += 1
+        index = round_up(index + n, config.expert_padding)
+
+    assert received_token_probs == expected_token_probs
 
     # Verify the combine output.
     torch.testing.assert_close(out_tokens, ref_out_tokens)
