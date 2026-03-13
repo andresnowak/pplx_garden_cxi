@@ -268,6 +268,119 @@ def _test_p2p_all_to_all_worker(
     torch.testing.assert_close(out_tokens, ref_out_tokens)
 
 
+def _test_p2p_all_to_all_moe_roundtrip_worker(
+    device: torch.device,
+    tp_group: Optional[ParallelGroup],
+    global_group: Optional[ParallelGroup],
+    config: _Config,
+) -> None:
+    assert tp_group is not None
+    assert global_group is not None
+
+    dp_rank = global_group.rank // tp_group.size
+    num_dp_groups = global_group.size // tp_group.size
+    num_local_experts = config.num_experts // global_group.size
+    max_recv_tokens = config.max_num_tokens * num_local_experts * num_dp_groups
+
+    local_rank = RankTestData.create(
+        num_experts=config.num_experts,
+        num_experts_per_token=config.num_experts_per_token,
+        max_num_tokens=config.max_num_tokens,
+        hidden_dim=config.hidden_dim,
+        hidden_dim_scale=config.hidden_dim_scale,
+        in_dtype=config.in_dtype,
+        scale_dtype=config.scale_dtype,
+        generator=_generator(device, dp_rank),
+        device=device,
+    )
+
+    node_group: Optional[ParallelGroup]
+    if config.nvlink_group is not None:
+        assert config.nvlink_group > 0
+        assert global_group.size % config.nvlink_group == 0
+        node_group = global_group.slice_by_count(
+            global_group.size // config.nvlink_group
+        )
+    else:
+        node_group = None
+
+    all_to_all = P2PAllToAll(
+        max_num_tokens=config.max_num_tokens,
+        num_experts=config.num_experts,
+        expert_padding=config.expert_padding,
+        hidden_dim=config.hidden_dim,
+        hidden_dim_scale=config.hidden_dim_scale,
+        max_private_tokens=config.max_private_tokens,
+        in_dtype=config.in_dtype,
+        out_dtype=config.out_dtype,
+        scale_dtype=config.scale_dtype,
+        num_experts_per_token=config.num_experts_per_token,
+        nets_per_gpu=config.nets_per_gpu,
+        device=device,
+        dp_group=tp_group,
+        node_group=node_group,
+        global_group=global_group,
+    )
+
+    try:
+        expert_num_tokens = torch.empty(
+            (num_local_experts,),
+            dtype=torch.int32,
+            device=device,
+        )
+        out_expert_x = torch.empty(
+            (max_recv_tokens, config.hidden_dim),
+            dtype=config.in_dtype,
+            device=device,
+        )
+        out_expert_prob = torch.empty(
+            (max_recv_tokens,),
+            dtype=torch.float32,
+            device=device,
+        )
+        out_tokens = torch.empty(
+            (config.max_num_tokens, config.hidden_dim),
+            dtype=config.out_dtype,
+            device=device,
+        )
+
+        if config.hidden_dim_scale is not None or config.scale_dtype is not None:
+            assert config.scale_dtype is not None
+            assert config.hidden_dim_scale is not None
+            out_expert_x_scale = torch.empty(
+                (max_recv_tokens, config.hidden_dim_scale),
+                dtype=config.scale_dtype,
+                device=device,
+            )
+        else:
+            out_expert_x_scale = None
+
+        all_to_all.dispatch(
+            out_expert_num_tokens=expert_num_tokens,
+            out_expert_x=out_expert_x,
+            out_expert_x_scale=out_expert_x_scale,
+            dp_x=local_rank.dp_x,
+            dp_x_scale=local_rank.dp_x_scale,
+            indices=local_rank.indices,
+            weights=local_rank.weights,
+            out_expert_prob=out_expert_prob,
+        )
+
+        expert_y = out_expert_x * out_expert_prob.unsqueeze(-1).to(out_expert_x.dtype)
+        all_to_all.combine(
+            out_tokens=out_tokens,
+            indices=local_rank.indices,
+            weights=torch.ones_like(local_rank.weights),
+            expert_y=expert_y.to(config.out_dtype),
+            bound_m=local_rank.bound_m,
+        )
+        torch.cuda.synchronize()
+    finally:
+        all_to_all.destroy()
+
+    torch.testing.assert_close(out_tokens, local_rank.dp_x.to(config.out_dtype))
+
+
 @mark_fabric
 @mark_kernel
 @gpu_only
@@ -587,5 +700,69 @@ def _test_p2p_all_to_all_worker(
 def test_p2p_all_to_all(config: _Config) -> None:
     ParallelLaunch(world_size=config.world_size, dp_size=config.dp_size).run(
         _test_p2p_all_to_all_worker,
+        config,
+    )
+
+
+@mark_fabric
+@mark_kernel
+@gpu_only
+@pytest.mark.xfail(
+    reason="Megatron-style routed-prob roundtrip semantics under investigation"
+)
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(
+            _Config(
+                world_size=2,
+                dp_size=1,
+                nets_per_gpu=1,
+                max_num_tokens=32,
+                num_experts=16,
+                hidden_dim=32,
+                hidden_dim_scale=None,
+                max_private_tokens=None,
+                num_experts_per_token=2,
+                in_dtype=torch.float32,
+                out_dtype=torch.float32,
+                scale_dtype=None,
+                expert_padding=1,
+                nvlink_group=None,
+            ),
+            marks=[
+                mark_ci_2gpu,
+                pytest.mark.skipif(not has_tp(2), reason="Requires 2 devices"),
+            ],
+            id="TP2-MoE-Roundtrip-FP32",
+        ),
+        pytest.param(
+            _Config(
+                world_size=4,
+                dp_size=1,
+                nets_per_gpu=1,
+                max_num_tokens=32,
+                num_experts=16,
+                hidden_dim=32,
+                hidden_dim_scale=None,
+                max_private_tokens=None,
+                num_experts_per_token=2,
+                in_dtype=torch.bfloat16,
+                out_dtype=torch.bfloat16,
+                scale_dtype=None,
+                expert_padding=1,
+                nvlink_group=None,
+            ),
+            marks=[
+                mark_ci_4gpu,
+                pytest.mark.skipif(not has_tp(4), reason="Requires 4 devices"),
+            ],
+            id="TP4-MoE-Roundtrip-BF16",
+        ),
+    ],
+)
+def test_p2p_all_to_all_moe_roundtrip(config: _Config) -> None:
+    ParallelLaunch(world_size=config.world_size, dp_size=config.dp_size).run(
+        _test_p2p_all_to_all_moe_roundtrip_worker,
         config,
     )
