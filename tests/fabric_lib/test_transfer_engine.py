@@ -21,26 +21,66 @@ from pplx_garden.fabric_lib import (
     TransferEngine,
 )
 from pplx_garden.utils import logging_utils
-#from tests.fabric import get_nets_per_gpu
-#from tests.markers import gpu_only, mark_ci_4gpu, mark_fabric
+# from tests.fabric import get_nets_per_gpu
+# from tests.markers import gpu_only, mark_ci_4gpu, mark_fabric
 
+import os
 from functools import cache
 from pathlib import Path
+
+import torch
+
+
+def _count_path_entries(path: str, pattern: str) -> int:
+    sysfs_path = Path(path)
+    if not sysfs_path.exists():
+        return 0
+    return len(list(sysfs_path.glob(pattern)))
+
+
+@cache
+def count_visible_gpus() -> int:
+    return torch.cuda.device_count()
 
 
 @cache
 def count_sys_nvidia() -> int:
-    return len(list(Path("/sys/bus/pci/drivers/nvidia/").glob("0000:*")))
+    return max(
+        count_visible_gpus(), _count_path_entries("/sys/bus/pci/drivers/nvidia/", "*:*")
+    )
+
+
+@cache
+def count_sys_cxi() -> int:
+    return _count_path_entries("/sys/class/cxi", "cxi*")
 
 
 @cache
 def count_sys_infiniband_verbs() -> int:
-    return len(list(Path("/sys/class/infiniband_verbs/").glob("uverbs*")))
+    return _count_path_entries("/sys/class/infiniband_verbs/", "uverbs*")
+
+
+@cache
+def count_network_endpoints() -> int:
+    env_override = os.environ.get("PPLX_TEST_NETS_PER_GPU")
+    if env_override is not None:
+        gpu_count = count_visible_gpus()
+        if gpu_count == 0:
+            return 0
+        return int(env_override) * gpu_count
+
+    cxi_count = count_sys_cxi()
+    if cxi_count > 0:
+        return cxi_count
+
+    return count_sys_infiniband_verbs()
 
 
 def get_nets_per_gpu() -> int:
-    return count_sys_infiniband_verbs() // count_sys_nvidia()
-
+    gpu_count = count_sys_nvidia()
+    if gpu_count == 0:
+        return 0
+    return count_network_endpoints() // gpu_count
 
 
 MESSAGE_BUF_SIZE = 64 << 20
@@ -94,7 +134,14 @@ def build_engine(selected_gpus: list[int], nets_per_gpu: int) -> TransferEngine:
             worker_cpu,
             uvm_cpu,
         )
-        print("Registered CUDA device "+str(group.cuda_device)+", CPU "+str(worker_cpu)+", UVM CPU "+str(uvm_cpu))
+        print(
+            "Registered CUDA device "
+            + str(group.cuda_device)
+            + ", CPU "
+            + str(worker_cpu)
+            + ", UVM CPU "
+            + str(uvm_cpu)
+        )
 
     return builder.build()
 
@@ -197,11 +244,11 @@ def _test_paged_write_server(
     selected_gpus: list[int],
     nets_per_gpu: int,
 ) -> None:
-        # Build the transfer engine.
+    # Build the transfer engine.
     engine = build_engine(selected_gpus, nets_per_gpu)
 
-        # Send over the server address.
-    print("Server address: "+str(engine.main_address))
+    # Send over the server address.
+    print("Server address: " + str(engine.main_address))
     conn.put(engine.main_address)
 
     # Register memory
@@ -243,7 +290,12 @@ def _test_paged_write_server(
 
     match request.content:
         case Paged() as paged:
-            print("Paged: page_bytes="+str(paged.len)+" ,num_pages="+str(len(paged.indices)))
+            print(
+                "Paged: page_bytes="
+                + str(paged.len)
+                + " ,num_pages="
+                + str(len(paged.indices))
+            )
 
             for i, res in enumerate(cuda_res):
                 tmp = generate_random_paged_data(paged, paged.seed, i)
@@ -270,7 +322,7 @@ def _test_paged_write_server(
                 )
 
         case Single() as single:
-            print("Single: bytes="+str(single.len))
+            print("Single: bytes=" + str(single.len))
             res = cuda_res[0]
 
             total_completions = 1
@@ -293,7 +345,7 @@ def _test_paged_write_server(
             )
 
         case Imm() as imm:
-            print("Imm: imm="+str(imm.imm))
+            print("Imm: imm=" + str(imm.imm))
 
             total_completions = 1
 
@@ -354,7 +406,7 @@ def _test_paged_write_client(
     nets_per_gpu: int,
 ) -> None:
     server_address = conn.get()
-    print("Received server address "+str(server_address))
+    print("Received server address " + str(server_address))
 
     engine = build_engine(selected_gpus, nets_per_gpu)
 
@@ -399,14 +451,14 @@ def _test_paged_write_client(
             assert torch.equal(page_gold, page_buf)
 
 
-#@pytest.fixture
+# @pytest.fixture
 def nets_per_gpu() -> int:
     return get_nets_per_gpu()
 
 
-#@mark_fabric
-#@gpu_only
-#@mark_ci_4gpu
+# @mark_fabric
+# @gpu_only
+# @mark_ci_4gpu
 def test_paged_write(nets_per_gpu: int) -> None:
     ctx = mp.get_context("spawn")
 
@@ -435,7 +487,7 @@ def _test_single_write_client(
     nets_per_gpu: int,
 ) -> None:
     server_address = conn.get()
-    print("Received server address "+str(server_address))
+    print("Received server address " + str(server_address))
 
     engine = build_engine(selected_gpus, nets_per_gpu)
 
@@ -476,9 +528,9 @@ def _test_single_write_client(
     assert torch.equal(gold, buf)
 
 
-#@mark_fabric
-#@gpu_only
-#@mark_ci_4gpu
+# @mark_fabric
+# @gpu_only
+# @mark_ci_4gpu
 def test_single_write(nets_per_gpu: int) -> None:
     ctx = mp.get_context("spawn")
 
@@ -546,9 +598,9 @@ def _test_imm_client(
     recv_queue.get()
 
 
-#@mark_fabric
-#@gpu_only
-#@mark_ci_4gpu
+# @mark_fabric
+# @gpu_only
+# @mark_ci_4gpu
 def test_imm(nets_per_gpu: int) -> None:
     ctx = mp.get_context("spawn")
 
@@ -572,15 +624,15 @@ def test_imm(nets_per_gpu: int) -> None:
 
 
 # ruff: noqa: ANN001
-#@triton.jit
+# @triton.jit
 def _inc_u64_kernel(ptr) -> None:
     ptr = tl.load(ptr).to(tl.pointer_type(tl.uint64))
     tl.store(ptr, tl.load(ptr) + 1)
 
 
-#@mark_fabric
-#@gpu_only
-#@mark_ci_4gpu
+# @mark_fabric
+# @gpu_only
+# @mark_ci_4gpu
 def test_uvm_watcher(nets_per_gpu: int) -> None:
     """Tests that the UVM watcher notices counter changes."""
 
@@ -657,15 +709,15 @@ def _test_single_write_cpu_recv(queue: mp.Queue) -> None:
     group = TransferEngine.detect_topology()[0]
     builder = TransferEngine.builder()
     builder.add_gpu_domains(
-            group.cuda_device,
-            group.domains,
-            group.cpus[0],
-            group.cpus[1],
-        )
+        group.cuda_device,
+        group.domains,
+        group.cpus[0],
+        group.cpus[1],
+    )
     engine = builder.build()
 
     def on_imm(imm: int) -> None:
-        print("Client! immediate number received! imm="+str(imm))
+        print("Client! immediate number received! imm=" + str(imm))
         assert imm == 555
         with recv_cond:
             recv_cond.notify_all()
@@ -673,28 +725,28 @@ def _test_single_write_cpu_recv(queue: mp.Queue) -> None:
     engine.set_imm_callback(on_imm)
 
     dst_buf = torch.zeros(
-            (CUDA_BUF_SIZE,),
-            dtype=torch.uint8,
-            device="cpu",
-        )
+        (CUDA_BUF_SIZE,),
+        dtype=torch.uint8,
+        device="cpu",
+    )
     _, dst_mr_desc = engine.register_tensor(dst_buf)
 
     queue.put(dst_mr_desc)
 
     recv_cond = threading.Condition()
 
-        # Wait for the packet to be received.
+    # Wait for the packet to be received.
     with recv_cond:
         recv_cond.wait()
 
-    print("dst_buf:"+str(dst_buf[:1024]))
+    print("dst_buf:" + str(dst_buf[:1024]))
 
     assert torch.all(dst_buf[:1024] == 1)
 
 
-#@mark_fabric
-#@gpu_only
-#@mark_ci_4gpu
+# @mark_fabric
+# @gpu_only
+# @mark_ci_4gpu
 def test_single_write_cpu_tensor() -> None:
     ctx = mp.get_context("spawn")
 
@@ -760,9 +812,9 @@ def _test_shard_single_write_at_the_end_of_mr_client(
     recv_queue.get()
 
 
-#@mark_fabric
-#@gpu_only
-#@mark_ci_4gpu
+# @mark_fabric
+# @gpu_only
+# @mark_ci_4gpu
 def test_shard_single_write_at_the_end_of_mr(nets_per_gpu: int) -> None:
     ctx = mp.get_context("spawn")
 
@@ -791,7 +843,7 @@ def _test_imm_count_client(
     nets_per_gpu: int,
 ) -> None:
     server_address = conn.get()
-    print("Received server address "+str(server_address))
+    print("Received server address " + str(server_address))
 
     engine = build_engine(selected_gpus, nets_per_gpu)
 
@@ -843,9 +895,9 @@ def _test_imm_count_client(
     assert imm_data.counts == {imm: num_extra * len(cuda_res)}
 
 
-#@mark_fabric
-#@gpu_only
-#@mark_ci_4gpu
+# @mark_fabric
+# @gpu_only
+# @mark_ci_4gpu
 def test_imm_count(nets_per_gpu: int) -> None:
     ctx = mp.get_context("spawn")
 
@@ -868,22 +920,26 @@ def test_imm_count(nets_per_gpu: int) -> None:
     assert server.exitcode == 0
 
 
-def _my_simple_write_server(conn: mp.Queue, selected_gpus: list[int], nets_per_gpu: int) -> None:
-    
+def _my_simple_write_server(
+    conn: mp.Queue, selected_gpus: list[int], nets_per_gpu: int
+) -> None:
+
     engine = build_engine(selected_gpus, nets_per_gpu)
     print(f"server: Server address: {engine.main_address}")
     conn.put(engine.main_address)
-    
-    cuda_buf = torch.ones((CUDA_BUF_SIZE,), dtype=torch.uint8, device="cuda:"+str(selected_gpus[0]))
+
+    cuda_buf = torch.ones(
+        (CUDA_BUF_SIZE,), dtype=torch.uint8, device="cuda:" + str(selected_gpus[0])
+    )
     cuda_mr_handle, cuda_mr_desc = engine.register_tensor(cuda_buf)
-        
+
     recv_queue: queue.Queue[bytes] = queue.Queue()
     engine.submit_bouncing_recvs(
-            1,
-            MESSAGE_BUF_SIZE,
-            recv_queue.put,
-            on_error_panic,
-        )
+        1,
+        MESSAGE_BUF_SIZE,
+        recv_queue.put,
+        on_error_panic,
+    )
     print("server: Wait for client request...")
     msg = recv_queue.get()
     request = pickle.loads(msg)
@@ -898,15 +954,15 @@ def _my_simple_write_server(conn: mp.Queue, selected_gpus: list[int], nets_per_g
     match request.content:
         case Single() as single:
             engine.submit_write(
-                    cuda_mr_handle,
-                    0,
-                    1024,
-                    None,
-                    single.mr_desc,
-                    single.offset,
-                    transfer_callback,
-                    on_error_panic,
-                )
+                cuda_mr_handle,
+                0,
+                1024,
+                None,
+                single.mr_desc,
+                single.offset,
+                transfer_callback,
+                on_error_panic,
+            )
             with cond:
                 cond.wait()
             print("server: Data sent success!")
@@ -922,27 +978,27 @@ def _my_simple_write_server(conn: mp.Queue, selected_gpus: list[int], nets_per_g
     )
     send_done.wait()
 
-def _my_simple_write_client(conn: mp.Queue, selected_gpus: list[int], nets_per_gpu: int):
+
+def _my_simple_write_client(
+    conn: mp.Queue, selected_gpus: list[int], nets_per_gpu: int
+):
 
     server_address = conn.get()
-    print("client: Received server address:"+str(server_address))
+    print("client: Received server address:" + str(server_address))
     engine = build_engine(selected_gpus, nets_per_gpu)
-    cuda_buf = torch.zeros((CUDA_BUF_SIZE,), dtype=torch.uint8, device="cuda:"+str(selected_gpus[0]))
+    cuda_buf = torch.zeros(
+        (CUDA_BUF_SIZE,), dtype=torch.uint8, device="cuda:" + str(selected_gpus[0])
+    )
 
     cuda_mr_handle, cuda_mr_desc = engine.register_tensor(cuda_buf)
     recv_queue = queue.Queue()
-    engine.submit_bouncing_recvs(
-            1,
-            MESSAGE_BUF_SIZE,
-            recv_queue.put,
-            on_error_panic
-        )
+    engine.submit_bouncing_recvs(1, MESSAGE_BUF_SIZE, recv_queue.put, on_error_panic)
     content = Single(
-            seed=0,
-            mr_desc = cuda_mr_desc,
-            offset=0,
-            len=1024,
-        )
+        seed=0,
+        mr_desc=cuda_mr_desc,
+        offset=0,
+        len=1024,
+    )
     request = Request(addr=engine.main_address, content=content)
 
     data = pickle.dumps(request)
@@ -954,50 +1010,46 @@ def _my_simple_write_client(conn: mp.Queue, selected_gpus: list[int], nets_per_g
     recv_queue.get()
     print("client: Data received from server!")
     buf = cuda_buf[:1024].to("cpu")
-    print("buf:"+str(buf))
+    print("buf:" + str(buf))
     expected = torch.ones(1024, dtype=torch.uint8)
 
     assert torch.equal(buf, expected), "client: Data not expected!"
 
-    
 
 def my_simple_write() -> None:
     ctx = mp.get_context("spawn")
-    queue  = ctx.Queue()
-    server = ctx.Process(
-                target = _my_simple_write_server,
-                args = (queue, [0], 1)
-            )
+    queue = ctx.Queue()
+    server = ctx.Process(target=_my_simple_write_server, args=(queue, [0], 1))
     server.start()
 
-    client = ctx.Process(
-                target = _my_simple_write_client,
-                args = (queue, [1], 1)
-            )
+    client = ctx.Process(target=_my_simple_write_client, args=(queue, [1], 1))
     client.start()
-    
+
     server.join()
     client.join()
     assert client.exitcode == 0, "Client failed!"
     assert server.exitcode == 0, "Server failed!"
     print("My simple write PASSED!")
 
-def _my_simple_write_server_cpu(conn: mp.Queue, selected_gpus: list[int], nets_per_gpu: int) -> None:
-    
+
+def _my_simple_write_server_cpu(
+    conn: mp.Queue, selected_gpus: list[int], nets_per_gpu: int
+) -> None:
+
     engine = build_engine(selected_gpus, nets_per_gpu)
     print(f"server: Server address: {engine.main_address}")
     conn.put(engine.main_address)
-    
+
     cpu_buf = torch.ones((CUDA_BUF_SIZE,), dtype=torch.uint8, device="cpu")
     cpu_mr_handle, cpu_mr_desc = engine.register_tensor(cpu_buf)
-        
+
     recv_queue: queue.Queue[bytes] = queue.Queue()
     engine.submit_bouncing_recvs(
-            1,
-            MESSAGE_BUF_SIZE,
-            recv_queue.put,
-            on_error_panic,
-        )
+        1,
+        MESSAGE_BUF_SIZE,
+        recv_queue.put,
+        on_error_panic,
+    )
     print("server: Wait for client request...")
     msg = recv_queue.get()
     request = pickle.loads(msg)
@@ -1012,15 +1064,15 @@ def _my_simple_write_server_cpu(conn: mp.Queue, selected_gpus: list[int], nets_p
     match request.content:
         case Single() as single:
             engine.submit_write(
-                    cpu_mr_handle,
-                    0,
-                    1024,
-                    None,
-                    single.mr_desc,
-                    single.offset,
-                    transfer_callback,
-                    on_error_panic,
-                )
+                cpu_mr_handle,
+                0,
+                1024,
+                None,
+                single.mr_desc,
+                single.offset,
+                transfer_callback,
+                on_error_panic,
+            )
             with cond:
                 cond.wait()
             print("server: Data sent success!")
@@ -1036,27 +1088,25 @@ def _my_simple_write_server_cpu(conn: mp.Queue, selected_gpus: list[int], nets_p
     )
     send_done.wait()
 
-def _my_simple_write_client_cpu(conn: mp.Queue, selected_gpus: list[int], nets_per_gpu: int):
+
+def _my_simple_write_client_cpu(
+    conn: mp.Queue, selected_gpus: list[int], nets_per_gpu: int
+):
 
     server_address = conn.get()
-    print("client: Received server address:"+str(server_address))
+    print("client: Received server address:" + str(server_address))
     engine = build_engine(selected_gpus, nets_per_gpu)
     cpu_buf = torch.zeros((CUDA_BUF_SIZE,), dtype=torch.uint8, device="cpu")
 
     cpu_mr_handle, cpu_mr_desc = engine.register_tensor(cpu_buf)
     recv_queue = queue.Queue()
-    engine.submit_bouncing_recvs(
-            1,
-            MESSAGE_BUF_SIZE,
-            recv_queue.put,
-            on_error_panic
-        )
+    engine.submit_bouncing_recvs(1, MESSAGE_BUF_SIZE, recv_queue.put, on_error_panic)
     content = Single(
-            seed=0,
-            mr_desc = cpu_mr_desc,
-            offset=0,
-            len=1024,
-        )
+        seed=0,
+        mr_desc=cpu_mr_desc,
+        offset=0,
+        len=1024,
+    )
     request = Request(addr=engine.main_address, content=content)
 
     data = pickle.dumps(request)
@@ -1068,40 +1118,34 @@ def _my_simple_write_client_cpu(conn: mp.Queue, selected_gpus: list[int], nets_p
     recv_queue.get()
     print("client: Data received from server!")
     buf = cpu_buf[:1024]
-    print("buf:"+str(buf))
+    print("buf:" + str(buf))
     expected = torch.ones(1024, dtype=torch.uint8)
 
     assert torch.equal(buf, expected), "client: Data not expected!"
 
-    
 
 def my_simple_write_cpu() -> None:
     ctx = mp.get_context("spawn")
-    queue  = ctx.Queue()
-    server = ctx.Process(
-                target = _my_simple_write_server_cpu,
-                args = (queue, [0], 1)
-            )
+    queue = ctx.Queue()
+    server = ctx.Process(target=_my_simple_write_server_cpu, args=(queue, [0], 1))
     server.start()
 
-    client = ctx.Process(
-                target = _my_simple_write_client_cpu,
-                args = (queue, [1], 1)
-            )
+    client = ctx.Process(target=_my_simple_write_client_cpu, args=(queue, [1], 1))
     client.start()
-    
+
     server.join()
     client.join()
     assert client.exitcode == 0, "Client failed!"
     assert server.exitcode == 0, "Server failed!"
     print("My simple write PASSED!")
 
+
 if __name__ == "__main__":
-#    test_single_write(1)
-#    test_paged_write(1)
-#    test_imm_count(1)
-#    test_shard_single_write_at_the_end_of_mr(1)
-#    test_imm(1)
-#    my_simple_write_cpu()
+    #    test_single_write(1)
+    #    test_paged_write(1)
+    #    test_imm_count(1)
+    #    test_shard_single_write_at_the_end_of_mr(1)
+    #    test_imm(1)
+    #    my_simple_write_cpu()
     test_single_write_cpu_tensor()
-#test_uvm_watcher(1)
+# test_uvm_watcher(1)
