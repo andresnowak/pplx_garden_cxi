@@ -76,6 +76,25 @@ impl CudaDeviceMemory {
         self.ptr.as_ptr() as *mut T
     }
 
+    pub fn to_vec<T: Copy + Default>(&self) -> Result<Vec<T>, CudartError> {
+        let elemsize = std::mem::size_of::<T>();
+        assert!(self.size.is_multiple_of(elemsize));
+        let len = self.size / elemsize;
+        let mut host = vec![T::default(); len];
+        let ret = unsafe {
+            cudart_sys::cudaMemcpy(
+                host.as_mut_ptr() as *mut c_void,
+                self.ptr.as_ptr(),
+                self.size,
+                cudart_sys::cudaMemcpyDeviceToHost,
+            )
+        };
+        if ret != 0 {
+            return Err(CudartError::new(ret, "cudaMemcpyDeviceToHost"));
+        }
+        Ok(host)
+    }
+
     pub fn as_mut_slice<T>(&mut self) -> &mut [T] {
         unsafe {
             std::slice::from_raw_parts_mut(

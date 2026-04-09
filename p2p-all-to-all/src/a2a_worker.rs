@@ -1,4 +1,5 @@
 use std::{
+    env,
     ffi::c_void,
     sync::{
         Arc,
@@ -771,7 +772,17 @@ impl WorkerState {
         //println!("worker: rank={:?}, num_recv_tokens={:?}, num_recv_efa_tokens={:?}", self.rank, num_recv_tokens, num_recv_efa_tokens);
 
         // Copy the buffers to the device.
-        self.padded_index.copy(&padded_index);
+        if env::var("PPLX_DEBUG_SKIP_PADDED_INDEX_COPY").ok().as_deref() != Some("1") {
+            if let Some(fill_value) = env::var("PPLX_DEBUG_PADDED_INDEX_FILL")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+            {
+                let filled = vec![fill_value; padded_index.len()];
+                self.padded_index.copy(&filled);
+            } else {
+                self.padded_index.copy(&padded_index);
+            }
+        }
         self.source_rank.copy(&source_rank);
         self.source_dispatch_offset.copy(&source_dispatch_offset);
         self.combine_send_offset.copy(&combine_send_offset);

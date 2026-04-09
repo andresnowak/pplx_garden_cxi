@@ -496,7 +496,7 @@ class P2PAllToAll(AllToAllKernel):
         expert_y_ptr = expert_y.data_ptr()
         expert_y_stride = expert_y.stride(0) * expert_y.dtype.itemsize
 
-        bound_m_ptr: Optional[int]
+        bound_m_pt: Optional[int]
         if bound_m is not None:
             assert bound_m.numel() == 1
             assert bound_m.dtype == torch.int32
@@ -545,3 +545,15 @@ class P2PAllToAll(AllToAllKernel):
             self._transfer_engine.stop()
             del self._transfer_engine
             self._transfer_engine = None
+
+    def debug_state(
+        self,
+        *,
+        max_token_offsets: Optional[int] = None,
+        max_recv_entries: Optional[int] = None,
+    ) -> dict[str, list[int]]:
+        assert self._all_to_all is not None
+        return self._all_to_all.debug_state(
+            max_token_offsets=max_token_offsets,
+            max_recv_entries=max_recv_entries,
+        )

@@ -8,7 +8,10 @@
 #include <nvtx3/nvToolsExt.h>
 
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
+#include <vector>
 
 using namespace rose;
 using namespace rose::device;
@@ -203,6 +206,18 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         if (i < num_experts) {
             expert_offset = tokens_per_expert[i];
             local_num_routed[i] = expert_offset;
+            printf(
+                "dispatch_send before_scan rank=%u block=%u thread=%u i=%u warp=%u lane=%u "
+                "tokens_per_expert=%u expert_offset=%u\n",
+                (unsigned)rank,
+                (unsigned)blockIdx.x,
+                (unsigned)threadIdx.x,
+                (unsigned)i,
+                (unsigned)warp_id,
+                (unsigned)lane_id,
+                (unsigned)tokens_per_expert[i],
+                (unsigned)expert_offset
+            );
         }
         __syncthreads();
         if (threadIdx.x == 0) {
@@ -218,6 +233,21 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
             expert_sums[warp_id] = expert_offset;
         }
         __syncthreads();
+        if (i < num_experts) {
+            printf(
+                "dispatch_send after_warp_scan rank=%u block=%u thread=%u i=%u warp=%u lane=%u "
+                "tokens_per_expert=%u expert_offset=%u expert_sum=%u\n",
+                (unsigned)rank,
+                (unsigned)blockIdx.x,
+                (unsigned)threadIdx.x,
+                (unsigned)i,
+                (unsigned)warp_id,
+                (unsigned)lane_id,
+                (unsigned)tokens_per_expert[i],
+                (unsigned)expert_offset,
+                (unsigned)expert_sums[warp_id]
+            );
+        }
 
         // Sum up the warp sums in the first warp.
         if (warp_id == 0) {
@@ -241,6 +271,20 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
             } else {
                 expert_offsets[i] = expert_offset;
             }
+            printf(
+                "dispatch_send after_expert_offsets rank=%u block=%u thread=%u i=%u warp=%u lane=%u "
+                "tokens_per_expert=%u expert_offset=%u expert_sum=%u expert_offsets=%u\n",
+                (unsigned)rank,
+                (unsigned)blockIdx.x,
+                (unsigned)threadIdx.x,
+                (unsigned)i,
+                (unsigned)warp_id,
+                (unsigned)lane_id,
+                (unsigned)tokens_per_expert[i],
+                (unsigned)expert_offset,
+                (unsigned)expert_sums[warp_id],
+                (unsigned)expert_offsets[i]
+            );
         }
     }
     __syncthreads();
@@ -553,6 +597,32 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
             }
         }
     }
+
+    // grid.sync();
+
+    // if (blockIdx.x == 0) {
+    //     const uint32_t i = threadIdx.x;
+    //     if (i < num_experts) {
+    //         printf(
+    //             "dispatch_send kernel_final_expert_offsets rank=%u block=%u thread=%u i=%u expert_offsets=%u\n",
+    //             (unsigned)rank,
+    //             (unsigned)blockIdx.x,
+    //             (unsigned)threadIdx.x,
+    //             (unsigned)i,
+    //             (unsigned)expert_offsets[i]
+    //         );
+    //     }
+    //     if (i < min((uint32_t)16, (uint32_t)(num_send_tokens * num_experts_per_token_bound))) {
+    //         printf(
+    //             "dispatch_send kernel_final_token_offset rank=%u block=%u thread=%u i=%u token_offset=%u\n",
+    //             (unsigned)rank,
+    //             (unsigned)blockIdx.x,
+    //             (unsigned)threadIdx.x,
+    //             (unsigned)i,
+    //             (unsigned)token_offset[i]
+    //         );
+    //     }
+    // }
 }
 
 
@@ -694,5 +764,32 @@ int a2a_kernels::a2a_dispatch_send(
         });
     });
     nvtxRangePop();
+
+    if (status == cudaSuccess) {
+        const char *debug_sync = std::getenv("PPLX_DEBUG_LAUNCHER_DISPATCH_SEND");
+        if (debug_sync && debug_sync[0] == '1' && debug_sync[1] == '\0') {
+            status = cudaStreamSynchronize((cudaStream_t)stream);
+            if (status == cudaSuccess) {
+                std::vector<uint32_t> host_expert_offsets(num_experts, 0);
+                status = cudaMemcpy(
+                    host_expert_offsets.data(),
+                    expert_offsets,
+                    num_experts * sizeof(uint32_t),
+                    cudaMemcpyDeviceToHost
+                );
+                if (status == cudaSuccess) {
+                    std::printf(
+                        "dispatch_send launcher_after_stream_sync rank=%u expert_offsets=",
+                        (unsigned)rank
+                    );
+                    for (size_t i = 0; i < num_experts; ++i) {
+                        std::printf("%s%u", i == 0 ? "[" : ", ", (unsigned)host_expert_offsets[i]);
+                    }
+                    std::printf("]\n");
+                }
+            }
+        }
+    }
+
     return status;
 }

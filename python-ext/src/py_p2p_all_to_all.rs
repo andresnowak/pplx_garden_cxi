@@ -5,8 +5,8 @@ use std::{
 
 use p2p_all_to_all::{AllToAllContext, AllToAllRankHandle};
 use pyo3::{
-    Bound, PyResult, exceptions::PyRuntimeError, pyclass, pymethods, types::PyModule,
-    types::PyModuleMethods,
+    Bound, PyResult, exceptions::PyRuntimeError, pyclass, pymethods, types::PyDict,
+    types::PyDictMethods, types::PyModule, types::PyModuleMethods,
 };
 use torch_lib::ScalarType;
 
@@ -203,6 +203,30 @@ impl PyAllToAllContext {
                 stream,
             )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    #[pyo3(signature = (max_token_offsets=None, max_recv_entries=None))]
+    fn debug_state<'py>(
+        &self,
+        py: pyo3::Python<'py>,
+        max_token_offsets: Option<usize>,
+        max_recv_entries: Option<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let state = self
+            .ctx
+            .debug_state(max_token_offsets, max_recv_entries)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("tokens_per_expert", state.tokens_per_expert)?;
+        dict.set_item("token_offset", state.token_offset)?;
+        dict.set_item("expert_offsets", state.expert_offsets)?;
+        dict.set_item("combine_send_offset", state.combine_send_offset)?;
+        dict.set_item("source_dispatch_offset", state.source_dispatch_offset)?;
+        dict.set_item("source_rank", state.source_rank)?;
+        dict.set_item("padded_index", state.padded_index)?;
+        dict.set_item("num_recv_tokens", state.num_recv_tokens)?;
+        Ok(dict)
     }
 }
 

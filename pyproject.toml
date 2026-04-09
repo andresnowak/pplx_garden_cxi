@@ -10,7 +10,7 @@ authors = [
     { name = "Nandor Licker", email = "nandor@perplexity.ai" },
 ]
 dynamic = ["version"]
-dependencies = ["numpy"]
+dependencies = ["numpy>=1.24.0,<2.2.0"]
 
 [tool.setuptools]
 package-dir = {"" = "python"}

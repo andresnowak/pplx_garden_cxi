@@ -1,8 +1,8 @@
-use std::{ffi::c_void, ptr::null_mut, sync::Arc, thread::JoinHandle};
+use std::{env, ffi::c_void, ptr::null_mut, sync::Arc, thread::JoinHandle};
 
 use anyhow::{Result, anyhow};
 use cuda_lib::{
-    CudaDeviceMemory, cuda_check,
+    CudaDeviceMemory, cuda_check, cudart_sys,
     rt::{CudartError, cudaGetNumSMs},
 };
 use fabric_lib::{TransferEngine, api::MemoryRegionHandle};
@@ -10,6 +10,17 @@ use thread_lib::pin_cpu;
 use torch_lib::ScalarType;
 
 use crate::{a2a_handles::AllToAllRankHandle, a2a_worker::WorkerState};
+
+pub struct AllToAllDebugState {
+    pub tokens_per_expert: Vec<u32>,
+    pub token_offset: Vec<u32>,
+    pub expert_offsets: Vec<u32>,
+    pub combine_send_offset: Vec<u32>,
+    pub source_dispatch_offset: Vec<u32>,
+    pub source_rank: Vec<u32>,
+    pub padded_index: Vec<u32>,
+    pub num_recv_tokens: Vec<u32>,
+}
 
 // Collects the private workspace buffers used by dispatch and combine.
 struct DeviceWorkspace {
@@ -120,6 +131,140 @@ pub struct AllToAllContext {
 }
 
 impl AllToAllContext {
+    fn debug_sync_dispatch_stream(stream: u64) -> Result<()> {
+        if env::var("PPLX_DEBUG_SYNC_DISPATCH_SEND").ok().as_deref() != Some("1") {
+            return Ok(());
+        }
+
+        let ret = unsafe {
+            cudart_sys::cudaStreamSynchronize(stream as cudart_sys::cudaStream_t)
+        };
+        if ret != 0 {
+            return Err(anyhow!(
+                "cudaStreamSynchronize failed after dispatch_send: {}",
+                ret
+            ));
+        }
+        Ok(())
+    }
+
+    fn debug_print_dispatch_memory_ranges(&self, label: &str) {
+        let expert_offsets_ptr = self.workspace.expert_offsets.ptr().as_ptr() as usize;
+        let expert_offsets_size = self.workspace.expert_offsets.size();
+        let token_offset_ptr = self.workspace.token_offset.ptr().as_ptr() as usize;
+        let token_offset_size = self.workspace.token_offset.size();
+        let send_buffer_ptr = self.worker.buffers.send_buffer_ptr as usize;
+        let recv_buffer_ptr = self.worker.buffers.recv_buffer_ptr as usize;
+        let tokens_per_expert_ptr = self.worker.tokens_per_expert.get_device_ptr() as usize;
+        let source_dispatch_offset_ptr =
+            self.worker.source_dispatch_offset.get_device_ptr() as usize;
+        let combine_send_offset_ptr =
+            self.worker.combine_send_offset.get_device_ptr() as usize;
+        let source_rank_ptr = self.worker.source_rank.get_device_ptr() as usize;
+        let padded_index_ptr = self.worker.padded_index.get_device_ptr() as usize;
+        let num_recv_tokens_ptr = self.worker.num_recv_tokens.get_device_ptr() as usize;
+
+        let tokens_per_expert_size = self.worker.tokens_per_expert.to_vec().len() * std::mem::size_of::<u32>();
+        let source_dispatch_offset_size =
+            self.worker.source_dispatch_offset.to_vec().len() * std::mem::size_of::<u32>();
+        let combine_send_offset_size =
+            self.worker.combine_send_offset.to_vec().len() * std::mem::size_of::<u32>();
+        let source_rank_size = self.worker.source_rank.to_vec().len() * std::mem::size_of::<u32>();
+        let padded_index_size = self.worker.padded_index.to_vec().len() * std::mem::size_of::<u32>();
+        let num_recv_tokens_size =
+            self.worker.num_recv_tokens.to_vec().len() * std::mem::size_of::<u32>();
+
+        let overlaps = |a_ptr: usize, a_size: usize, b_ptr: usize, b_size: usize| {
+            let a_end = a_ptr.saturating_add(a_size);
+            let b_end = b_ptr.saturating_add(b_size);
+            a_ptr < b_end && b_ptr < a_end
+        };
+
+        println!(
+            "dispatch memory ranges {} rank={} expert_offsets=[0x{:x}, 0x{:x}) token_offset=[0x{:x}, 0x{:x}) send_buffer=0x{:x} recv_buffer=0x{:x} tokens_per_expert=[0x{:x}, 0x{:x}) source_dispatch_offset=[0x{:x}, 0x{:x}) combine_send_offset=[0x{:x}, 0x{:x}) source_rank=[0x{:x}, 0x{:x}) padded_index=[0x{:x}, 0x{:x}) num_recv_tokens=[0x{:x}, 0x{:x}) overlap_expert_tokens={} overlap_expert_source_dispatch={} overlap_expert_combine_send={} overlap_expert_source_rank={} overlap_expert_padded={} overlap_token_tokens={} overlap_token_source_dispatch={} overlap_token_combine_send={} overlap_token_source_rank={} overlap_token_padded={}",
+            label,
+            self.rank,
+            expert_offsets_ptr,
+            expert_offsets_ptr.saturating_add(expert_offsets_size),
+            token_offset_ptr,
+            token_offset_ptr.saturating_add(token_offset_size),
+            send_buffer_ptr,
+            recv_buffer_ptr,
+            tokens_per_expert_ptr,
+            tokens_per_expert_ptr.saturating_add(tokens_per_expert_size),
+            source_dispatch_offset_ptr,
+            source_dispatch_offset_ptr.saturating_add(source_dispatch_offset_size),
+            combine_send_offset_ptr,
+            combine_send_offset_ptr.saturating_add(combine_send_offset_size),
+            source_rank_ptr,
+            source_rank_ptr.saturating_add(source_rank_size),
+            padded_index_ptr,
+            padded_index_ptr.saturating_add(padded_index_size),
+            num_recv_tokens_ptr,
+            num_recv_tokens_ptr.saturating_add(num_recv_tokens_size),
+            overlaps(
+                expert_offsets_ptr,
+                expert_offsets_size,
+                tokens_per_expert_ptr,
+                tokens_per_expert_size,
+            ),
+            overlaps(
+                expert_offsets_ptr,
+                expert_offsets_size,
+                source_dispatch_offset_ptr,
+                source_dispatch_offset_size,
+            ),
+            overlaps(
+                expert_offsets_ptr,
+                expert_offsets_size,
+                combine_send_offset_ptr,
+                combine_send_offset_size,
+            ),
+            overlaps(
+                expert_offsets_ptr,
+                expert_offsets_size,
+                source_rank_ptr,
+                source_rank_size,
+            ),
+            overlaps(
+                expert_offsets_ptr,
+                expert_offsets_size,
+                padded_index_ptr,
+                padded_index_size,
+            ),
+            overlaps(
+                token_offset_ptr,
+                token_offset_size,
+                tokens_per_expert_ptr,
+                tokens_per_expert_size,
+            ),
+            overlaps(
+                token_offset_ptr,
+                token_offset_size,
+                source_dispatch_offset_ptr,
+                source_dispatch_offset_size,
+            ),
+            overlaps(
+                token_offset_ptr,
+                token_offset_size,
+                combine_send_offset_ptr,
+                combine_send_offset_size,
+            ),
+            overlaps(
+                token_offset_ptr,
+                token_offset_size,
+                source_rank_ptr,
+                source_rank_size,
+            ),
+            overlaps(
+                token_offset_ptr,
+                token_offset_size,
+                padded_index_ptr,
+                padded_index_size,
+            ),
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         hidden_dim: usize,
@@ -281,6 +426,45 @@ impl AllToAllContext {
         Ok(())
     }
 
+    pub fn debug_state(
+        &self,
+        max_token_offsets: Option<usize>,
+        max_recv_entries: Option<usize>,
+    ) -> Result<AllToAllDebugState> {
+        let token_offset_len = self.max_num_tokens * self.num_experts_per_token;
+
+        let token_offset = self.workspace.token_offset.to_vec::<u32>()?;
+        let expert_offsets = self.workspace.expert_offsets.to_vec::<u32>()?;
+        let tokens_per_expert = self.worker.tokens_per_expert.to_vec();
+        let combine_send_offset = self.worker.combine_send_offset.to_vec();
+        let source_dispatch_offset = self.worker.source_dispatch_offset.to_vec();
+        let source_rank = self.worker.source_rank.to_vec();
+        let padded_index = self.worker.padded_index.to_vec();
+        let num_recv_tokens = self.worker.num_recv_tokens.to_vec();
+        let recv_len = combine_send_offset.len();
+        let tokens_per_expert = self.worker.tokens_per_expert.to_vec();
+
+        Ok(AllToAllDebugState {
+            tokens_per_expert,
+            token_offset: token_offset[..max_token_offsets
+                .unwrap_or(token_offset_len)
+                .min(token_offset_len)]
+                .to_vec(),
+            expert_offsets,
+            combine_send_offset: combine_send_offset
+                [..max_recv_entries.unwrap_or(recv_len).min(recv_len)]
+                .to_vec(),
+            source_dispatch_offset: source_dispatch_offset
+                [..max_recv_entries.unwrap_or(recv_len).min(recv_len)]
+                .to_vec(),
+            source_rank: source_rank[..max_recv_entries.unwrap_or(recv_len).min(recv_len)]
+                .to_vec(),
+            padded_index: padded_index[..max_recv_entries.unwrap_or(recv_len).min(recv_len)]
+                .to_vec(),
+            num_recv_tokens,
+        })
+    }
+
     #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn dispatch_send(
         &mut self,
@@ -340,7 +524,16 @@ impl AllToAllContext {
             stream,
         ))?;
 
+        Self::debug_sync_dispatch_stream(stream)?;
 
+        let expert_offsets = self.workspace.expert_offsets.to_vec::<u32>()?;
+        let token_offset = self.workspace.token_offset.to_vec::<u32>()?;
+        println!(
+            "dispatch_send debug after_stream_sync rank={} expert_offsets={:?} token_offset_prefix={:?}",
+            self.rank,
+            &expert_offsets[..expert_offsets.len().min(16)],
+            &token_offset[..token_offset.len().min(16)],
+        );
 
         if self.worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));
@@ -360,7 +553,7 @@ impl AllToAllContext {
         out_x_scale_stride_token: usize,
         stream: u64,
     ) -> Result<()> {
-
+        self.debug_print_dispatch_memory_ranges("before_dispatch_recv");
 
         cuda_check!(a2a_kernels::a2a_dispatch_recv(
             self.num_blocks,
@@ -402,6 +595,16 @@ impl AllToAllContext {
         if self.worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));
         }
+
+        let expert_offsets = self.workspace.expert_offsets.to_vec::<u32>()?;
+        let token_offset = self.workspace.token_offset.to_vec::<u32>()?;
+        self.debug_print_dispatch_memory_ranges("after_dispatch_recv");
+        println!(
+            "dispatch_recv debug rank={} expert_offsets={:?} token_offset_prefix={:?}",
+            self.rank,
+            &expert_offsets[..expert_offsets.len().min(16)],
+            &token_offset[..token_offset.len().min(16)],
+        );
 
         Ok(())
     }

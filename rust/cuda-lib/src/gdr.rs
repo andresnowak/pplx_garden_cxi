@@ -186,7 +186,7 @@ impl GdrFlag {
         self.buffer.write(value as u8);
     }
 
-    fn is_set(&self) -> bool {
+    pub fn is_set(&self) -> bool {
         self.buffer.read::<u8>() != 0
     }
 }
@@ -210,5 +210,20 @@ impl<T: Sized> GdrVec<T> {
     pub fn copy(&self, value: &[T]) {
         debug_assert!(value.len() <= self.len);
         self.buffer.copy_to(value.as_ptr() as *const c_void, size_of_val(value));
+    }
+
+    pub fn to_vec(&self) -> Vec<T>
+    where
+        T: Copy + Default,
+    {
+        let mut host = vec![T::default(); self.len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.buffer.mapped_ptr as *const T,
+                host.as_mut_ptr(),
+                self.len,
+            );
+        }
+        host
     }
 }

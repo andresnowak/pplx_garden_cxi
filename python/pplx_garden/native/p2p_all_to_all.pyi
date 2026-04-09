@@ -97,3 +97,8 @@ class AllToAllContext:
         accumulate: bool,
         stream: int,
     ) -> None: ...
+    def debug_state(
+        self,
+        max_token_offsets: int | None = None,
+        max_recv_entries: int | None = None,
+    ) -> dict[str, list[int]]: ...
