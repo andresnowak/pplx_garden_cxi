@@ -46,15 +46,21 @@ impl GdrCopyContext {
     fn alloc_buffer(&self, nbytes: usize) -> GdrResult<GdrBuffer> {
         let mut device_ptr: u64 = 0;
         let page_size: usize = 1 << 16; // 64KB page size
-        let bytesize = nbytes.div_ceil(page_size) * page_size;
+        let bytesize = nbytes.div_ceil(page_size) * page_size; // Round up to a multiple of the page size, since GDRCopy requires page-aligned buffers.
 
-        if unsafe { cuda_sys::cuMemAlloc(&mut device_ptr, bytesize + page_size) }
+        // Allocate bytesize + 2*page_size: one page of slack before and after the
+        // aligned region so that no other cuMemAlloc can share the physical pages we
+        // pin with gdr_pin_buffer.
+        if unsafe { cuda_sys::cuMemAlloc(&mut device_ptr, bytesize + 2 * page_size) }
             != cuda_sys::CUDA_SUCCESS
         {
             return Err(CudaError::GdrCopyError("Failed to allocate GDR buffer"));
         }
 
-        let aligned_device_ptr = align_to(device_ptr, page_size);
+        // Align upward past the first page_size of slack, guaranteeing the aligned
+        // region is fully inside our allocation with owned memory on both sides.
+        // let aligned_device_ptr = align_to(device_ptr, page_size);
+        let aligned_device_ptr = align_to(device_ptr + page_size as u64, page_size);
 
         let context = self.context.clone();
 
