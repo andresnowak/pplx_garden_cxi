@@ -70,6 +70,7 @@ void a2a_dispatch_recv_kernel(
         uint4 *x_token_dst;
         float *x_scale_src;
         float *x_scale_dst;
+        uint32_t padded_index;
     };
     constexpr size_t NUM_STAGES = 8;
 
@@ -85,6 +86,7 @@ void a2a_dispatch_recv_kernel(
             local_stage[i].x_scale_src = (float*)(recv_buffer + src_index * token_stride + token_dim_bound);
             local_stage[i].x_token_dst = (uint4*)(out_x_ptr + dst_index * out_x_stride);
             local_stage[i].x_scale_dst = (float*)(out_x_scale_ptr + dst_index * out_x_scale_stride_token);
+            local_stage[i].padded_index = dst_index;
         }
         __syncthreads();
     };
@@ -139,11 +141,11 @@ void a2a_dispatch_recv_kernel(
         uint4 *x_token_src;
         ExpertAndOffset *meta_src;
         if (token_rank == rank) {
-            x_token_src = (uint4*)(send_buffer + position * token_stride);
+            x_token_src = (uint4*)(send_buffer + position * token_stride); // local buffer
         } else if (position & (1u << 31)) {
-            x_token_src = (uint4*)(send_ptrs[local_rank] + (position & ~(1u << 31)) * token_stride);
+            x_token_src = (uint4*)(send_ptrs[local_rank] + (position & ~(1u << 31)) * token_stride); // NVLink overflow
         } else {
-            x_token_src = (uint4*)(recv_buffer + position * token_stride);
+            x_token_src = (uint4*)(recv_buffer + position * token_stride); // NVLink private
         }
         meta_src = (ExpertAndOffset*)((std::byte*)x_token_src + token_stride - sizeof(ExpertAndOffset));
 
@@ -166,6 +168,13 @@ void a2a_dispatch_recv_kernel(
             }
         }
         if (threadIdx.x == 0 && out_prob_ptr) {
+            if (meta_src->weight < 0.0f || meta_src->weight > 1.0f) {
+                printf(
+                    "dispatch_recv BAD_WEIGHT rank=%u token=%u padded_token=%u position=%u weight=%f token_stride=%zu\n",
+                    (unsigned)rank, (unsigned)token, (unsigned)padded_token,
+                    (unsigned)position, meta_src->weight, token_stride
+                );
+            }
             out_prob_ptr[padded_token] = meta_src->weight;
         }
     }
@@ -212,7 +221,7 @@ void a2a_dispatch_recv_kernel(
             float *x_scale_dst = local_stage[s].x_scale_dst;
             float *x_scale_src = local_stage[s].x_scale_src;
             ExpertAndOffset *meta_src = (ExpertAndOffset*)((std::byte*)x_token_src + token_stride - sizeof(ExpertAndOffset));
-            uint32_t padded_token = shared_stage[s].dst_index;
+            uint32_t padded_token = local_stage[s].padded_index; // padded token index pos from the present stage since shared stage will already contain the token info from the next stage
 
             for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += blockDim.x) {
                 const bool has_scale = out_x_scale_ptr && i < hidden_dim_scale_bound;
@@ -227,6 +236,13 @@ void a2a_dispatch_recv_kernel(
                 }
             }
             if (threadIdx.x == 0 && out_prob_ptr) {
+                if (meta_src->weight < 0.0f || meta_src->weight > 1.0f) {
+                    printf(
+                        "dispatch_recv BAD_WEIGHT_EFA rank=%u token=%u padded_token=%u weight=%f token_stride=%zu\n",
+                        (unsigned)rank, (unsigned)token, (unsigned)padded_token,
+                        meta_src->weight, token_stride
+                    );
+                }
                 out_prob_ptr[padded_token] = meta_src->weight;
             }
 
