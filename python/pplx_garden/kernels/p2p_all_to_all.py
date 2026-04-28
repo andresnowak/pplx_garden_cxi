@@ -551,9 +551,26 @@ class P2PAllToAll(AllToAllKernel):
         *,
         max_token_offsets: Optional[int] = None,
         max_recv_entries: Optional[int] = None,
-    ) -> dict[str, list[int]]:
+    ) -> dict[str, object]:
         assert self._all_to_all is not None
         return self._all_to_all.debug_state(
             max_token_offsets=max_token_offsets,
             max_recv_entries=max_recv_entries,
         )
+
+    def debug_poison_transport_buffers(self, *, value: int = 0xA5) -> None:
+        """Fill the internal transport buffers with a sentinel byte pattern."""
+
+        if not 0 <= value <= 0xFF:
+            msg = f"Poison value must fit in one byte, got {value}"
+            raise ValueError(msg)
+
+        self._send_buffer_mapping.to_tensor(
+            (self._send_buffer_mapping.size,),
+            torch.uint8,
+        ).fill_(value)
+        self._recv_buffer_mapping.to_tensor(
+            (self._recv_buffer_mapping.size,),
+            torch.uint8,
+        ).fill_(value)
+        self._num_routed_buffer.fill_(value)
