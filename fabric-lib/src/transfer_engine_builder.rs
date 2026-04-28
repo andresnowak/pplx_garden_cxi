@@ -91,6 +91,7 @@ impl TransferEngineBuilder {
             let domain_list: Vec<_> = spec.domains.to_vec();
             let worker = Worker {
                 domain_list,
+                cuda_device: spec.cuda_device,
                 pin_worker_cpu: Some(spec.pin_worker_cpu),
                 pin_uvm_cpu: Some(spec.pin_uvm_cpu),
             };

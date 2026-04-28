@@ -6,7 +6,12 @@ use std::{
     str::FromStr,
 };
 
-use cuda_lib::rt::{cudaDeviceProp, cudaGetDeviceCount, cudaGetDeviceProperties};
+use cuda_lib::rt::{
+    cudaDeviceProp,
+    cudaGetDevice,
+    cudaGetDeviceCount,
+    cudaGetDeviceProperties,
+};
 use once_cell::sync::Lazy;
 
 use crate::{
@@ -469,7 +474,9 @@ fn read_pci_device_id(pci_addr: &PciAddress) -> Result<PciDeviceId> {
 }
 
 fn get_gpu_pci_device_id() -> Result<PciDeviceId> {
-    let prop = cudaGetDeviceProperties(0)?;
+    let mut current_device = 0;
+    cudaGetDevice(&mut current_device)?;
+    let prop = cudaGetDeviceProperties(current_device)?;
     let pci_addr = PciAddress::from(&prop);
     read_pci_device_id(&pci_addr)
 }
