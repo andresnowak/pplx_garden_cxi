@@ -156,7 +156,7 @@ impl PagedWriteOpIter {
             page_indices_end: op.page_indices_end,
             src_ptr: unsafe { op.src_ptr.byte_add(op.src_offset as usize) },
             src_stride: op.src_stride,
-            dst_ptr: op.dst_ptr + op.dst_offset,
+            dst_ptr: op.dst_offset, // We are using the offset-from-MR-base addressing, so dst_ptr holds the base offset within the MR (memory region).
             dst_stride: op.dst_stride,
             buf,
             flags,
@@ -197,8 +197,10 @@ impl PagedWriteOpIter {
         iov.iov_base = unsafe {
             self.src_ptr.as_ptr().byte_add(self.src_stride as usize * src_page_idx)
         };
-        //rma_iov.addr = self.dst_ptr + self.dst_stride * dst_page_idx as u64;
-        rma_iov.addr = self.dst_stride * dst_page_idx as u64;
+        // CXI uses offset-from-MR-base: rkey encodes the base VA, addr is byte offset within it.
+        // dst_ptr holds dst_offset (the base offset within the MR), so the per-page addr is
+        // dst_offset + stride * page_idx. dst_ptr is now just the dst_offset, and the page offset is calculated here in fill_msg.
+        rma_iov.addr = self.dst_ptr + self.dst_stride * dst_page_idx as u64;
     }
 }
 
