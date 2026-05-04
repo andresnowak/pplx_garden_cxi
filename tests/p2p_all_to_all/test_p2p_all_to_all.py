@@ -257,23 +257,24 @@ def _test_p2p_all_to_all_worker(
     else:
         node_group = None
 
+    # Instantiate the all-to-all kernel.
     all_to_all = P2PAllToAll(
-                max_num_tokens=max_num_tokens,
-                num_experts=num_experts,
-                expert_padding=config.expert_padding,
-                hidden_dim=hidden_dim,
-                hidden_dim_scale=hidden_dim_scale,
-                max_private_tokens=config.max_private_tokens,
-                in_dtype=in_dtype,
-                out_dtype=out_dtype,
-                scale_dtype=scale_dtype,
-                num_experts_per_token=num_experts_per_token,
-                nets_per_gpu=config.nets_per_gpu,
-                device=device,
-                dp_group=tp_group,
-                node_group=node_group,
-                global_group=global_group,
-            )
+        max_num_tokens=max_num_tokens,
+        num_experts=num_experts,
+        expert_padding=config.expert_padding,
+        hidden_dim=hidden_dim,
+        hidden_dim_scale=hidden_dim_scale,
+        max_private_tokens=config.max_private_tokens,
+        in_dtype=in_dtype,
+        out_dtype=out_dtype,
+        scale_dtype=scale_dtype,
+        num_experts_per_token=num_experts_per_token,
+        nets_per_gpu=config.nets_per_gpu,
+        device=device,
+        dp_group=tp_group,
+        node_group=node_group,
+        global_group=global_group,
+    )
 
     print(f"[rank={global_group.rank}] Starting all-to-all with config: {config}", flush=True)
 
