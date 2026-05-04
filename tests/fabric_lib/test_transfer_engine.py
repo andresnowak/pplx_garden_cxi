@@ -1,10 +1,13 @@
 # ruff: noqa: T201
 
 import dataclasses
+import multiprocessing as std_mp
 import pickle
 import queue
 import signal
 import threading
+import time
+import traceback
 from typing import Any, assert_never
 
 import pytest
@@ -126,11 +129,12 @@ def build_engine(selected_gpus: list[int], nets_per_gpu: int) -> TransferEngine:
     for group in system_topo:
         if group.cuda_device not in selected_gpus:
             continue
+        domains = group.domains[:nets_per_gpu]
         worker_cpu = group.cpus[0]
         uvm_cpu = group.cpus[1]
         builder.add_gpu_domains(
             group.cuda_device,
-            group.domains,
+            domains,
             worker_cpu,
             uvm_cpu,
         )
@@ -141,6 +145,10 @@ def build_engine(selected_gpus: list[int], nets_per_gpu: int) -> TransferEngine:
             + str(worker_cpu)
             + ", UVM CPU "
             + str(uvm_cpu)
+            + ", domains "
+            + str([domain.name for domain in domains])
+            + ", current_device "
+            + str(torch.cuda.current_device())
         )
 
     return builder.build()
@@ -160,16 +168,43 @@ def alloc_and_register_memory(
 ) -> list[CudaResource]:
     cuda_res = []
     for cuda_device in selected_gpus:
+        print(
+            "Torch CUDA device state before set_device:",
+            {
+                "requested_device": cuda_device,
+                "current_device": torch.cuda.current_device(),
+            },
+        )
+
+        # original_device = torch.cuda.current_device()
+        # torch.cuda.set_device(cuda_device)
         cuda_buf = torch.empty(
             CUDA_BUF_SIZE,
             dtype=torch.uint8,
             device=f"cuda:{cuda_device}",
         )
+        print(
+            "Registering CUDA tensor:",
+            {
+                "shape": tuple(cuda_buf.shape),
+                "dtype": str(cuda_buf.dtype),
+                "numel": cuda_buf.numel(),
+                "element_size": cuda_buf.element_size(),
+                "data_ptr": hex(cuda_buf.data_ptr()),
+                "is_contiguous": cuda_buf.is_contiguous(),
+                "device": str(cuda_buf.device),
+                "current_device": torch.cuda.current_device(),
+            },
+        )
+
+        torch.cuda.synchronize()
 
         cuda_mr_handle, cuda_mr_desc = engine.register_tensor(cuda_buf)
         cuda_res.append(
             CudaResource(cuda_device, cuda_buf, cuda_mr_handle, cuda_mr_desc)
         )
+        # torch.cuda.set_device(original_device)
+
     return cuda_res
 
 
@@ -253,6 +288,7 @@ def _test_paged_write_server(
 
     # Register memory
     cuda_res = alloc_and_register_memory(selected_gpus, engine)
+    print("Server: CUDA memory registration complete")
 
     # Submit bouncing recvs
     recv_queue: queue.Queue[bytes] = queue.Queue()
@@ -262,6 +298,7 @@ def _test_paged_write_server(
         recv_queue.put,
         on_error_panic,
     )
+    print("Server: bouncing recvs submitted")
 
     # Setup signal handler
     stop_server = False
@@ -411,6 +448,7 @@ def _test_paged_write_client(
     engine = build_engine(selected_gpus, nets_per_gpu)
 
     cuda_res = alloc_and_register_memory(selected_gpus, engine)
+    # here cuda_res is full of zeros.
 
     recv_queue: queue.Queue[bytes] = queue.Queue()
     engine.submit_bouncing_recvs(
@@ -448,10 +486,11 @@ def _test_paged_write_client(
             offset = content.offset + page_idx * content.stride
             page_gold = gold[offset : offset + content.len]
             page_buf = buf[offset : offset + content.len]
-            assert torch.equal(page_gold, page_buf)
+            print(f"page_gold: {page_gold} \n page_buf: {page_buf}")
+            torch.testing.assert_close(page_gold, page_buf, rtol=0, atol=0)
 
 
-# @pytest.fixture
+@pytest.fixture
 def nets_per_gpu() -> int:
     return get_nets_per_gpu()
 
@@ -486,46 +525,56 @@ def _test_single_write_client(
     selected_gpus: list[int],
     nets_per_gpu: int,
 ) -> None:
-    server_address = conn.get()
-    print("Received server address " + str(server_address))
+    try:
+        server_address = conn.get()
+        print("Received server address " + str(server_address))
 
-    engine = build_engine(selected_gpus, nets_per_gpu)
+        engine = build_engine(selected_gpus, nets_per_gpu)
 
-    cuda_res = alloc_and_register_memory(selected_gpus, engine)
-    res = cuda_res[0]
+        cuda_res = alloc_and_register_memory(selected_gpus, engine)
+        print("Client: CUDA memory registration complete")
+        res = cuda_res[0]
 
-    recv_queue: queue.Queue[bytes] = queue.Queue()
-    engine.submit_bouncing_recvs(
-        1,
-        MESSAGE_BUF_SIZE,
-        recv_queue.put,
-        on_error_panic,
-    )
+        recv_queue: queue.Queue[bytes] = queue.Queue()
+        engine.submit_bouncing_recvs(
+            1,
+            MESSAGE_BUF_SIZE,
+            recv_queue.put,
+            on_error_panic,
+        )
+        print("Client: bouncing recvs submitted")
 
-    # Send request
-    content = Single(
-        seed=0xABCDABCD987,
-        mr_desc=res.cuda_mr_desc,
-        offset=1024,
-        len=1000,
-    )
-    request = Request(
-        addr=engine.main_address,
-        content=content,
-    )
-    data = pickle.dumps(request)
-    send_done = threading.Event()
-    engine.submit_send(server_address, data, send_done.set, on_error_panic)
+        # Send request
+        content = Single(
+            seed=0xABCDABCD987,
+            mr_desc=res.cuda_mr_desc,
+            offset=1024,
+            len=1000,
+        )
+        request = Request(
+            addr=engine.main_address,
+            content=content,
+        )
+        data = pickle.dumps(request)
+        send_done = threading.Event()
+        engine.submit_send(server_address, data, send_done.set, on_error_panic)
+        print("Client: request submitted")
 
-    # Wait for SEND and RECVcompletion
-    send_done.wait()
-    recv_queue.get()
+        # Wait for SEND and RECVcompletion
+        send_done.wait()
+        print("Client: send completion received")
+        recv_queue.get()
+        print("Client: response received")
 
-    # Verify data
-    gold = generate_random_bytes(content.seed - 1, content.len)
-    buf = res.cuda_buf[content.offset : content.offset + content.len].to("cpu")
+        # Verify data
+        gold = generate_random_bytes(content.seed - 1, content.len)
+        buf = res.cuda_buf[content.offset : content.offset + content.len].to("cpu")
 
-    assert torch.equal(gold, buf)
+        assert torch.equal(gold, buf)
+    except Exception:
+        print("_test_single_write_client failed")
+        traceback.print_exc()
+        raise
 
 
 # @mark_fabric
@@ -547,9 +596,11 @@ def test_single_write(nets_per_gpu: int) -> None:
     )
     client.start()
     client.join()
+    print(f"Client exitcode: {client.exitcode}")
     assert client.exitcode == 0
 
     server.join()
+    print(f"Server exitcode: {server.exitcode}")
     assert server.exitcode == 0
 
 
@@ -624,7 +675,7 @@ def test_imm(nets_per_gpu: int) -> None:
 
 
 # ruff: noqa: ANN001
-# @triton.jit
+@triton.jit
 def _inc_u64_kernel(ptr) -> None:
     ptr = tl.load(ptr).to(tl.pointer_type(tl.uint64))
     tl.store(ptr, tl.load(ptr) + 1)
@@ -1140,12 +1191,108 @@ def my_simple_write_cpu() -> None:
     print("My simple write PASSED!")
 
 
+# def _spawn_register_only_child(
+#     selected_gpus: list[int], nets_per_gpu: int, sleep_secs: int
+# ) -> None:
+#     try:
+#         first_gpu = selected_gpus[0]
+#         print(
+#             "spawn-register-only: pre-initializing CUDA context",
+#             {
+#                 "first_gpu": first_gpu,
+#                 "current_device_before": torch.cuda.current_device(),
+#             },
+#         )
+#         torch.cuda.set_device(first_gpu)
+#         torch.cuda.init()
+#         torch.empty(1, dtype=torch.uint8, device=f"cuda:{first_gpu}")
+#         torch.cuda.synchronize(first_gpu)
+#         print(
+#             "spawn-register-only: CUDA context initialized",
+#             {
+#                 "first_gpu": first_gpu,
+#                 "current_device_after": torch.cuda.current_device(),
+#             },
+#         )
+#         print(f"spawn-register-only: building engine for GPUs {selected_gpus}")
+#         engine = build_engine(selected_gpus, nets_per_gpu)
+#         alloc_and_register_memory(selected_gpus, engine)
+#         print(
+#             "spawn-register-only: registration complete for GPUs "
+#             + str(selected_gpus)
+#             + f", sleeping {sleep_secs}s"
+#         )
+#         time.sleep(sleep_secs)
+#     except Exception:
+#         print(f"_spawn_register_only_child failed for GPUs {selected_gpus}")
+#         traceback.print_exc()
+#         raise
+
+
+# def test_spawn_register_only(nets_per_gpu: int) -> None:
+#     ctx = mp.get_context("spawn")
+#     sleep_secs = 10
+
+#     server = ctx.Process(
+#         target=_spawn_register_only_child,
+#         args=([2, 3], nets_per_gpu, sleep_secs),
+#     )
+#     server.start()
+
+#     client = ctx.Process(
+#         target=_spawn_register_only_child,
+#         args=([0, 1], nets_per_gpu, sleep_secs),
+#     )
+#     client.start()
+
+#     client.join()
+#     print(f"spawn-register-only client exitcode: {client.exitcode}")
+#     assert client.exitcode == 0
+
+#     server.join()
+#     print(f"spawn-register-only server exitcode: {server.exitcode}")
+#     assert server.exitcode == 0
+
+
+# def test_spawn_register_only_stdlib(nets_per_gpu: int) -> None:
+#     ctx = std_mp.get_context("spawn")
+#     sleep_secs = 10
+
+#     server = ctx.Process(
+#         target=_spawn_register_only_child,
+#         args=([2, 3], nets_per_gpu, sleep_secs),
+#     )
+#     server.start()
+
+#     client = ctx.Process(
+#         target=_spawn_register_only_child,
+#         args=([0, 1], nets_per_gpu, sleep_secs),
+#     )
+#     client.start()
+
+#     client.join()
+#     print(f"spawn-register-only-stdlib client exitcode: {client.exitcode}")
+#     assert client.exitcode == 0
+
+#     server.join()
+#     print(f"spawn-register-only-stdlib server exitcode: {server.exitcode}")
+#     assert server.exitcode == 0
+
+
 if __name__ == "__main__":
-    #    test_single_write(1)
-    #    test_paged_write(1)
-    #    test_imm_count(1)
-    #    test_shard_single_write_at_the_end_of_mr(1)
-    #    test_imm(1)
+    print("Running test_single_write...")
+    test_single_write(1)
+    print("Running test_paged_write...")
+    test_paged_write(1)
+    print("Running test_imm_count...")
+    test_imm_count(1)
+    print("Running test_shard_single_write_at_the_end_of_mr...")
+    test_shard_single_write_at_the_end_of_mr(1)
+    print("Running test_imm...")
+    test_imm(1)
     #    my_simple_write_cpu()
-    test_single_write_cpu_tensor()
-# test_uvm_watcher(1)
+    # test_spawn_register_only(1)
+    #    test_spawn_register_only_stdlib(1)
+    # test_single_write_cpu_tensor()
+    print("Running test_uvm_watcher...")
+    test_uvm_watcher(1)
