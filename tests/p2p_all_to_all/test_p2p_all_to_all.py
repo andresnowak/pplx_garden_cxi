@@ -257,15 +257,7 @@ def _test_p2p_all_to_all_worker(
     else:
         node_group = None
 
-    all_to_all: Optional[P2PAllToAll] = None
-
-    print(f"[rank={global_group.rank}] Starting all-to-all with config: {config}", flush=True)
-
-    try:
-        for rep in range(repetitions):
-            logger.info("Starting all-to-all repetition %d/%d", rep + 1, repetitions)
-
-            all_to_all = P2PAllToAll(
+    all_to_all = P2PAllToAll(
                 max_num_tokens=max_num_tokens,
                 num_experts=num_experts,
                 expert_padding=config.expert_padding,
@@ -283,9 +275,14 @@ def _test_p2p_all_to_all_worker(
                 global_group=global_group,
             )
 
-            if hasattr(all_to_all, "debug_poison_transport_buffers"):
-                all_to_all.debug_poison_transport_buffers(value=0)
-                torch.cuda.synchronize()
+    print(f"[rank={global_group.rank}] Starting all-to-all with config: {config}", flush=True)
+
+    try:
+        for rep in range(repetitions):
+            logger.info("Starting all-to-all repetition %d/%d", rep + 1, repetitions)
+
+            # all_to_all.debug_poison_transport_buffers(value=0)
+            # torch.cuda.synchronize()
 
             expected_num_tokens = torch.sum(
                 torch.stack(
@@ -544,9 +541,6 @@ def _test_p2p_all_to_all_worker(
             # print(f"[rank={global_group.rank}] Completed all-to-all repetition {rep + 1}/{repetitions} out_tokens={out_tokens.tolist()}, ref_out_tokens={ref_out_tokens.tolist()} local_rank indices: {local_rank.indices.tolist()}", flush=True)
 
             print(f"[rank={global_group.rank}] Completed all-to-all repetition {rep + 1}/{repetitions}", flush=True)
-
-            all_to_all.destroy()
-            all_to_all = None
     
             # global_group.barrier()
             # all_to_all.destroy() # NOTE: Fixes the problem if we also create a new all_to_all at the beginning of the loop
