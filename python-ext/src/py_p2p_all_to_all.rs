@@ -205,6 +205,14 @@ impl PyAllToAllContext {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    fn wait_ready(&self) {
+        self.ctx.wait_ready();
+    }
+
+    fn reset_counters(&self) {
+        self.ctx.reset_counters();
+    }
+
     #[pyo3(signature = (max_token_offsets=None, max_recv_entries=None))]
     fn debug_state<'py>(
         &self,
@@ -226,6 +234,15 @@ impl PyAllToAllContext {
         dict.set_item("source_rank", state.source_rank)?;
         dict.set_item("padded_index", state.padded_index)?;
         dict.set_item("num_recv_tokens", state.num_recv_tokens)?;
+        dict.set_item("sum_tokens_per_expert", state.sum_tokens_per_expert)?;
+        dict.set_item("num_recv_tokens_main", state.num_recv_tokens_main)?;
+        dict.set_item("num_recv_efa_tokens", state.num_recv_efa_tokens)?;
+        dict.set_item("total_padded_tokens", state.total_padded_tokens)?;
+        dict.set_item("max_padded_index", state.max_padded_index)?;
+        dict.set_item(
+            "padded_index_out_of_bounds",
+            state.padded_index_out_of_bounds,
+        )?;
         Ok(dict)
     }
 }

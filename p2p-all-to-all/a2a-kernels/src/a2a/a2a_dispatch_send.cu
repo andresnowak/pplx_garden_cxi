@@ -206,22 +206,22 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         if (i < num_experts) {
             expert_offset = tokens_per_expert[i];
             local_num_routed[i] = expert_offset;
-            printf(
-                "dispatch_send before_scan rank=%u block=%u thread=%u i=%u warp=%u lane=%u "
-                "tokens_per_expert=%u expert_offset=%u\n",
-                (unsigned)rank,
-                (unsigned)blockIdx.x,
-                (unsigned)threadIdx.x,
-                (unsigned)i,
-                (unsigned)warp_id,
-                (unsigned)lane_id,
-                (unsigned)tokens_per_expert[i],
-                (unsigned)expert_offset
-            );
+            // printf(
+            //     "dispatch_send before_scan rank=%u block=%u thread=%u i=%u warp=%u lane=%u "
+            //     "tokens_per_expert=%u expert_offset=%u\n",
+            //     (unsigned)rank,
+            //     (unsigned)blockIdx.x,
+            //     (unsigned)threadIdx.x,
+            //     (unsigned)i,
+            //     (unsigned)warp_id,
+            //     (unsigned)lane_id,
+            //     (unsigned)tokens_per_expert[i],
+            //     (unsigned)expert_offset
+            // );
         }
         __syncthreads();
         if (threadIdx.x == 0) {
-            st_mmio_b8(dispatch_route_done, 1);
+            st_mmio_b8(dispatch_route_done, 1); // Signal for host worker uvm to know that the `num_routed` counts are ready, so as to start exchanging routing metadata
         }
         for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
             unsigned warp_sum_expert = __shfl_up_sync(0xFFFFFFFF, expert_offset, offset);
@@ -233,21 +233,21 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
             expert_sums[warp_id] = expert_offset;
         }
         __syncthreads();
-        if (i < num_experts) {
-            printf(
-                "dispatch_send after_warp_scan rank=%u block=%u thread=%u i=%u warp=%u lane=%u "
-                "tokens_per_expert=%u expert_offset=%u expert_sum=%u\n",
-                (unsigned)rank,
-                (unsigned)blockIdx.x,
-                (unsigned)threadIdx.x,
-                (unsigned)i,
-                (unsigned)warp_id,
-                (unsigned)lane_id,
-                (unsigned)tokens_per_expert[i],
-                (unsigned)expert_offset,
-                (unsigned)expert_sums[warp_id]
-            );
-        }
+        // if (i < num_experts) {
+        //     printf(
+        //         "dispatch_send after_warp_scan rank=%u block=%u thread=%u i=%u warp=%u lane=%u "
+        //         "tokens_per_expert=%u expert_offset=%u expert_sum=%u\n",
+        //         (unsigned)rank,
+        //         (unsigned)blockIdx.x,
+        //         (unsigned)threadIdx.x,
+        //         (unsigned)i,
+        //         (unsigned)warp_id,
+        //         (unsigned)lane_id,
+        //         (unsigned)tokens_per_expert[i],
+        //         (unsigned)expert_offset,
+        //         (unsigned)expert_sums[warp_id]
+        //     );
+        // }
 
         // Sum up the warp sums in the first warp.
         if (warp_id == 0) {
@@ -271,20 +271,6 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
             } else {
                 expert_offsets[i] = expert_offset;
             }
-            printf(
-                "dispatch_send after_expert_offsets rank=%u block=%u thread=%u i=%u warp=%u lane=%u "
-                "tokens_per_expert=%u expert_offset=%u expert_sum=%u expert_offsets=%u\n",
-                (unsigned)rank,
-                (unsigned)blockIdx.x,
-                (unsigned)threadIdx.x,
-                (unsigned)i,
-                (unsigned)warp_id,
-                (unsigned)lane_id,
-                (unsigned)tokens_per_expert[i],
-                (unsigned)expert_offset,
-                (unsigned)expert_sums[warp_id],
-                (unsigned)expert_offsets[i]
-            );
         }
     }
     __syncthreads();
@@ -378,7 +364,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                 if (threadIdx.x == 0) {
                     auto counter = add_release_gpu_u32(grid_counter, 1) + 1;
                     if (counter == num_send_tokens) {
-                        st_mmio_b8(dispatch_send_done, 1);
+                        st_mmio_b8(dispatch_send_done, 1); // Signal to uvm worker host thread that the send buffer is ready for all tokens, so as to start the all-to-all exchange
                         *grid_counter = 0;
                     }
                 }
@@ -425,10 +411,21 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
 
                 __syncthreads();
 
+                // dispatch_send_done is the host-worker wakeup for the remote
+                // transport path, not the final same-node consumer-read barrier.
+                // It is allowed to fire once the send-buffer-backed remote
+                // exchange can begin, even though the loop below still performs
+                // same-node NVLink writes directly into peer private recv buffers.
+                //
+                // Those NVLink-private writes are not consumed under
+                // dispatch_send_done. They are consumed only after the later
+                // sync_ptrs/sync_counter handshake published at the end of this
+                // kernel, which is what dispatch_recv waits on before reading the
+                // same-node private path.
                 if (threadIdx.x == 0) {
                     auto counter = add_release_gpu_u32(grid_counter, 1) + 1;
                     if (counter == num_send_tokens) {
-                        st_mmio_b8(dispatch_send_done, 1);
+                        st_mmio_b8(dispatch_send_done, 1); // Signal to uvm worker host thread that the send_buffer is ready for all tokens, so as to start the all-to-all exchange
                         *grid_counter = 0;
                     }
                 }
@@ -566,6 +563,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
 
                         // If the destination is within the same node, write using NVLink.
                         if (dst_node == node_rank && dst_rank != rank && route.offset < max_private_tokens) {
+                            // If we are in the same DP group, we can write directly to the peer's private recv buffer using NVLink.
                             if (dst_rank % dp_size == rank % dp_size) {
                                 // Write to the private recv buffer directly using NVLink.
                                 const uint32_t local_peer = dst_rank % NODE_SIZE;
@@ -592,37 +590,11 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         if (blockIdx.x == 0) {
             auto local_rank = rank % NODE_SIZE;
             if (threadIdx.x < NODE_SIZE) {
-                auto *flag = &sync_ptrs[threadIdx.x][local_rank + NODE_SIZE];
+                auto *flag = &sync_ptrs[threadIdx.x][local_rank + NODE_SIZE]; // mark that this rank has finished its same-node NVLINK writing to the send buffer and the recv ranks on same node can start reading
                 st_release_u32(flag, counter + 1);
             }
         }
     }
-
-    // grid.sync();
-
-    // if (blockIdx.x == 0) {
-    //     const uint32_t i = threadIdx.x;
-    //     if (i < num_experts) {
-    //         printf(
-    //             "dispatch_send kernel_final_expert_offsets rank=%u block=%u thread=%u i=%u expert_offsets=%u\n",
-    //             (unsigned)rank,
-    //             (unsigned)blockIdx.x,
-    //             (unsigned)threadIdx.x,
-    //             (unsigned)i,
-    //             (unsigned)expert_offsets[i]
-    //         );
-    //     }
-    //     if (i < min((uint32_t)16, (uint32_t)(num_send_tokens * num_experts_per_token_bound))) {
-    //         printf(
-    //             "dispatch_send kernel_final_token_offset rank=%u block=%u thread=%u i=%u token_offset=%u\n",
-    //             (unsigned)rank,
-    //             (unsigned)blockIdx.x,
-    //             (unsigned)threadIdx.x,
-    //             (unsigned)i,
-    //             (unsigned)token_offset[i]
-    //         );
-    //     }
-    // }
 }
 
 

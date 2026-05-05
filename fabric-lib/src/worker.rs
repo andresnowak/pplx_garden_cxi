@@ -234,9 +234,7 @@ impl Worker {
         let uvm_thread_builder =
             std::thread::Builder::new().name("tx_engine_uvm_worker".to_string());
         let uvm_handle = uvm_thread_builder
-            .spawn(move || {
-                uvm_worker_thread(self.cuda_device, self.pin_uvm_cpu, init_uvm_tx, cq_tx)
-            })
+            .spawn(move || uvm_worker_thread(self.cuda_device, self.pin_uvm_cpu, init_uvm_tx, cq_tx))
             .map_err(|_| FabricLibError::Custom("Failed to spawn UVM worker thread"))?;
 
         Ok(InitializingWorker {

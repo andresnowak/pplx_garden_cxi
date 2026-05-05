@@ -865,6 +865,98 @@ fn client_main(args: Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn register_only_main(args: Vec<String>) -> anyhow::Result<()> {
+    if args.len() != 2 && args.len() != 4 {
+        eprintln!("Register-only Usage:");
+        eprintln!("  {} --register-only", args[0]);
+        eprintln!("  {} --register-only selected_gpus nets_per_gpu", args[0]);
+        eprintln!("Example:");
+        eprintln!("  {} --register-only 0 1", args[0]);
+        eprintln!("  {} --register-only 1,2,3 1", args[0]);
+        std::process::exit(1);
+    }
+
+    let mut engine_args = vec![args[0].clone()];
+    if args.len() == 4 {
+        engine_args.push(args[2].clone());
+        engine_args.push(args[3].clone());
+    }
+
+    let (selected_gpus, engine) = build_engine(&engine_args)?;
+    println!(
+        "Initialized FabricEngine. num_nets={}, nets_per_gpu={}, link_speed={:.0}Gbps",
+        engine.num_domains(),
+        engine.num_domains() / selected_gpus.len(),
+        engine.aggregated_link_speed() as f64 / 1e9,
+    );
+    println!(
+        "Env: FI_HMEM_DISABLE_P2P={:?} FI_MR_CACHE_MAX_COUNT={:?} \
+FI_CXI_DISABLE_HMEM_DEV_REGISTER={:?} FI_CXI_FORCE_DEV_REG_COPY={:?}",
+        std::env::var("FI_HMEM_DISABLE_P2P").ok(),
+        std::env::var("FI_MR_CACHE_MAX_COUNT").ok(),
+        std::env::var("FI_CXI_DISABLE_HMEM_DEV_REGISTER").ok(),
+        std::env::var("FI_CXI_FORCE_DEV_REG_COPY").ok(),
+    );
+
+    let MemoryResource { _host_box, host_buf, host_mr_handle: _host_mr_handle, cuda_res } =
+        alloc_and_register_memory(&selected_gpus, &engine)?;
+    println!("Registration-only repro succeeded for GPUs {:?}", selected_gpus);
+
+    unregister_memory(&engine, host_buf, &cuda_res)?;
+    println!("Unregister complete");
+    Ok(())
+}
+
+fn register_only_wait_main(args: Vec<String>) -> anyhow::Result<()> {
+    if args.len() != 3 && args.len() != 5 {
+        eprintln!("Register-only-wait Usage:");
+        eprintln!("  {} --register-only-wait wait_secs", args[0]);
+        eprintln!(
+            "  {} --register-only-wait wait_secs selected_gpus nets_per_gpu",
+            args[0]
+        );
+        eprintln!("Example:");
+        eprintln!("  {} --register-only-wait 30 0 1", args[0]);
+        eprintln!("  {} --register-only-wait 30 1,2,3 1", args[0]);
+        std::process::exit(1);
+    }
+
+    let wait_secs = args[2].parse::<u64>()?;
+    let mut engine_args = vec![args[0].clone()];
+    if args.len() == 5 {
+        engine_args.push(args[3].clone());
+        engine_args.push(args[4].clone());
+    }
+
+    let (selected_gpus, engine) = build_engine(&engine_args)?;
+    println!(
+        "Initialized FabricEngine. num_nets={}, nets_per_gpu={}, link_speed={:.0}Gbps",
+        engine.num_domains(),
+        engine.num_domains() / selected_gpus.len(),
+        engine.aggregated_link_speed() as f64 / 1e9,
+    );
+    println!(
+        "Env: FI_HMEM_DISABLE_P2P={:?} FI_MR_CACHE_MAX_COUNT={:?} \
+FI_CXI_DISABLE_HMEM_DEV_REGISTER={:?} FI_CXI_FORCE_DEV_REG_COPY={:?}",
+        std::env::var("FI_HMEM_DISABLE_P2P").ok(),
+        std::env::var("FI_MR_CACHE_MAX_COUNT").ok(),
+        std::env::var("FI_CXI_DISABLE_HMEM_DEV_REGISTER").ok(),
+        std::env::var("FI_CXI_FORCE_DEV_REG_COPY").ok(),
+    );
+
+    let MemoryResource { _host_box, host_buf, host_mr_handle: _host_mr_handle, cuda_res } =
+        alloc_and_register_memory(&selected_gpus, &engine)?;
+    println!(
+        "Registration-only-wait repro succeeded for GPUs {:?}, sleeping {}s",
+        selected_gpus, wait_secs
+    );
+    thread::sleep(Duration::from_secs(wait_secs));
+
+    unregister_memory(&engine, host_buf, &cuda_res)?;
+    println!("Unregister complete");
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     logging_lib::init(&logging_lib::LoggingOpts {
         log_format: logging_lib::LogFormat::Text,
@@ -872,5 +964,13 @@ fn main() -> anyhow::Result<()> {
         log_directives: None,
     })?;
     let args = std::env::args().collect::<Vec<_>>();
-    if args.len() <= 3 { server_main(args) } else { client_main(args) }
+    if args.get(1).is_some_and(|arg| arg == "--register-only") {
+        register_only_main(args)
+    } else if args.get(1).is_some_and(|arg| arg == "--register-only-wait") {
+        register_only_wait_main(args)
+    } else if args.len() <= 3 {
+        server_main(args)
+    } else {
+        client_main(args)
+    }
 }

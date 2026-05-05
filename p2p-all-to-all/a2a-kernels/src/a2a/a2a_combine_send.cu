@@ -196,11 +196,37 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
                 if (token_node == rank_node) {
                     unsigned first_peer = (token_rank / DP_SIZE) * DP_SIZE;
                     // Copy the token into the recv buffer of the receiving node via NVLink.
+                    // if (threadIdx.x == 0 && i == 0) {
+                    //     printf(
+                    //         "Token %u is local rank %llu. Copying to peers on the same node. Token rank: %u, first peer: %u\n",
+                    //         token + s * gridDim.x,
+                    //         (unsigned long long)rank,
+                    //         token_rank,
+                    //         first_peer
+                    //     );
+                    // }
                     #pragma unroll(DP_SIZE)
                     for (unsigned dp_peer = 0; dp_peer < DP_SIZE; dp_peer++) {
-                        auto token_peer = (first_peer + dp_peer) % NODE_SIZE;
+                        auto raw_peer = first_peer + dp_peer;
+                        auto token_peer = raw_peer % NODE_SIZE;
+                        // if (threadIdx.x == 0 && i == 0) {
+                        //     printf(
+                        //         "thread %u stage %u rank %llu Copying token %u to raw peer %u -> local peer %u (token rank %u) at offset %u with first peer %u and DP_SIZE %u and NODE_SIZE %u\n",
+                        //         threadIdx.x,
+                        //         s,
+                        //         (unsigned long long)rank,
+                        //         token + s * gridDim.x,
+                        //         raw_peer,
+                        //         token_peer,
+                        //         token_rank,
+                        //         offset,
+                        //         first_peer,
+                        //         (unsigned)DP_SIZE,
+                        //         (unsigned)NODE_SIZE
+                        //     );
+                        // }
                         auto *x_token_dst = (uint4*)(recv_ptrs_local[token_peer] + offset * token_bound);
-                        st_global_nc_uint4(&x_token_dst[i], values[s]);
+                        st_global_nc_uint4(&x_token_dst[i], values[s]); // Copy the same token to all DP peers on the same node
                     }
                 }
             }

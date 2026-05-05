@@ -170,23 +170,22 @@ impl EfaDomain {
             // All data transfer should go through RDMA.
             let optval = false;
             let fi_setopt = (*(*ep.as_ptr()).ops).setopt.unwrap_unchecked();
-            /*
-            let ret = fi_setopt(
-                ep_fid,
-                FI_OPT_ENDPOINT as i32,
-                FI_OPT_SHARED_MEMORY_PERMITTED as i32,
-                &optval as *const _ as *mut c_void,
-                std::mem::size_of_val(&optval),
-            );
-            */
 
-            if ret != 0 {
-                return Err(LibfabricError::new(
-                    ret,
-                    "fi_setopt FI_OPT_SHARED_MEMORY_PERMITTED false",
-                )
-                .into());
-            }
+            // let ret = fi_setopt(
+            //     ep_fid,
+            //     FI_OPT_ENDPOINT as i32,
+            //     FI_OPT_SHARED_MEMORY_PERMITTED as i32,
+            //     &optval as *const _ as *mut c_void,
+            //     std::mem::size_of_val(&optval),
+            // );
+
+            // if ret != 0 {
+            //     return Err(LibfabricError::new(
+            //         ret,
+            //         "fi_setopt FI_OPT_SHARED_MEMORY_PERMITTED false",
+            //     )
+            //     .into());
+            // }
             let ret = fi_setopt(
                 ep_fid,
                 FI_OPT_ENDPOINT as i32,
@@ -309,12 +308,14 @@ impl EfaDomain {
 
         let mut original_cuda_device: i32 = 0;
         cudaGetDevice(&mut original_cuda_device);
+        let mut target_cuda_device: Option<i32> = None;
 
         match region.mapping() {
             Mapping::Host => {
                 mr_attr.__bindgen_anon_1.mr_iov = &iov;
             }
             Mapping::Device { device_id, dmabuf_fd: None } => {
+                target_cuda_device = Some(device_id.0 as i32);
 
                 if original_cuda_device != device_id.0 as i32 {
                     cudaSetDevice(device_id.0 as i32);
@@ -325,6 +326,7 @@ impl EfaDomain {
                 mr_attr.__bindgen_anon_1.mr_iov = &iov;
             }
             Mapping::Device { device_id, dmabuf_fd: Some(dmabuf_fd) } => {
+                target_cuda_device = Some(device_id.0 as i32);
                 mr_attr.iface = FI_HMEM_CUDA;
                 mr_attr.device.cuda = device_id.0 as i32;
                 dmabuf.fd = *dmabuf_fd;
@@ -332,6 +334,29 @@ impl EfaDomain {
                 flags = FI_MR_DMABUF;
             }
         }
+
+        let mut current_cuda_device_before_regattr: i32 = -1;
+        cudaGetDevice(&mut current_cuda_device_before_regattr);
+
+        debug!(
+            domain = %self.info.name(),
+            ptr = ?region.ptr(),
+            len = region.len(),
+            allow_remote,
+            original_cuda_device,
+            target_cuda_device,
+            current_cuda_device_before_regattr,
+            mapping = ?region.mapping(),
+            using_dmabuf = matches!(
+                region.mapping(),
+                Mapping::Device {
+                    dmabuf_fd: Some(_),
+                    ..
+                }
+            ),
+            flags,
+            "calling fi_mr_regattr"
+        );
 
         let ret = unsafe {
             let fi_mr_regattr =
@@ -343,7 +368,6 @@ impl EfaDomain {
         let mr = NonNull::new(mr)
             .ok_or_else(|| LibfabricError::new(ret, "fi_mr_regattr"))?;
 
-        
         // pxz
         let ret = unsafe {
             let mr_fid = &raw mut (*mr.as_ptr()).fid;
@@ -374,7 +398,7 @@ impl EfaDomain {
 
         self.local_mr_map.insert(region.ptr(), mr);
 
-        cudaSetDevice(original_cuda_device); 
+        cudaSetDevice(original_cuda_device);
 
         Ok(MemoryRegionRemoteKey(unsafe { mr.as_ref() }.key))
     }
@@ -502,7 +526,7 @@ impl EfaDomain {
 
         let fi_writemsg =
             unsafe { (*(*context.ep.as_ptr()).rma).writemsg.unwrap_unchecked() };
-        
+
         let fi_writedata =
             unsafe { (*(*context.ep.as_ptr()).rma).writedata.unwrap_unchecked() };
 
@@ -513,7 +537,7 @@ impl EfaDomain {
             if msg.is_null() {
                 break;
             }
-            
+
             //pxz
             let msg_ref = unsafe { &*(msg as *const fi_msg_rma) };
             /*
@@ -564,7 +588,7 @@ impl EfaDomain {
                     if msg_data.iov_count == 0 {
                         let buf = ptr::null();
                         let len = 0;
-                        
+
                         let ret = fi_writedata(
                             context.ep.as_ptr(),
                             buf,
@@ -655,7 +679,7 @@ impl EfaDomain {
                     }
                     _ => panic!("fi_writemsg returned undocumented error: {}", ret),
                 }
-            
+
             }
 
 

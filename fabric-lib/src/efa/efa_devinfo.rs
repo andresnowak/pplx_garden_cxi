@@ -78,8 +78,9 @@ pub fn get_efa_domains() -> Result<Vec<EfaDomainInfo>> {
             | FI_MR_PROV_KEY) as i32;
         */
 
-        (*h.domain_attr).mr_mode = (FI_MR_ENDPOINT  
+        (*h.domain_attr).mr_mode = (FI_MR_ENDPOINT
             | FI_MR_ALLOCATED
+            | FI_MR_HMEM // ?: Should we have the HMEM flag?
             | FI_MR_PROV_KEY) as i32;
 
         (*h.domain_attr).threading = FI_THREAD_DOMAIN;

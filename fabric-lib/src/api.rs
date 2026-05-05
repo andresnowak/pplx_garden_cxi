@@ -214,6 +214,10 @@ impl ImmCounter {
             std::hint::spin_loop();
         }
     }
+
+    pub fn reset(&self) {
+        self.counter.store(0, Ordering::SeqCst);
+    }
 }
 
 /// An immediate counter that sets a flag via GdrCopy.
@@ -233,6 +237,10 @@ impl GdrCounter {
         if old >= target as i64 {
             self.flag.set(true);
         }
+    }
+
+    pub fn reset(&self) {
+        self.counter.store(0, Ordering::SeqCst);
     }
 }
 
