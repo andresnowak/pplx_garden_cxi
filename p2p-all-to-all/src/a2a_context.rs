@@ -20,6 +20,12 @@ pub struct AllToAllDebugState {
     pub source_rank: Vec<u32>,
     pub padded_index: Vec<u32>,
     pub num_recv_tokens: Vec<u32>,
+    pub sum_tokens_per_expert: u32,
+    pub num_recv_tokens_main: u32,
+    pub num_recv_efa_tokens: u32,
+    pub total_padded_tokens: u32,
+    pub max_padded_index: Option<u32>,
+    pub padded_index_out_of_bounds: usize,
 }
 
 // Collects the private workspace buffers used by dispatch and combine.
@@ -119,6 +125,7 @@ pub struct AllToAllContext {
     max_num_tokens: usize,
     num_experts_per_token: usize,
     max_private_tokens: usize,
+    expert_padding: usize,
     rank: usize,
     dp_size: usize,
     node_size: usize,
@@ -401,6 +408,7 @@ impl AllToAllContext {
             max_num_tokens,
             num_experts_per_token,
             max_private_tokens,
+            expert_padding,
             rank,
             dp_size,
             node_size,
@@ -411,6 +419,23 @@ impl AllToAllContext {
             thread,
             num_blocks,
         })
+    }
+
+    /// Reset all ImmCounters/GdrCounters to 0 to prevent stale cycle-N CQEs
+    /// from poisoning cycle-N+1 counters. Must only be called when the worker
+    /// is idle (after wait_ready()) and all EFA operations have completed.
+    pub fn reset_counters(&self) {
+        self.worker.reset_counters();
+    }
+
+    /// Spin-wait until the worker thread has fully completed the current step
+    /// (i.e. `tx_ready` is set). Call this before a cross-rank barrier between
+    /// repetitions to ensure all in-flight EFA operations from this rank have
+    /// drained before the next cycle starts.
+    pub fn wait_ready(&self) {
+        while !self.worker.tx_ready.is_set() {
+            std::hint::spin_loop();
+        }
     }
 
     pub fn destroy(&mut self) -> Result<()> {
@@ -435,7 +460,6 @@ impl AllToAllContext {
 
         let token_offset = self.workspace.token_offset.to_vec::<u32>()?;
         let expert_offsets = self.workspace.expert_offsets.to_vec::<u32>()?;
-        let tokens_per_expert = self.worker.tokens_per_expert.to_vec();
         let combine_send_offset = self.worker.combine_send_offset.to_vec();
         let source_dispatch_offset = self.worker.source_dispatch_offset.to_vec();
         let source_rank = self.worker.source_rank.to_vec();
@@ -443,6 +467,23 @@ impl AllToAllContext {
         let num_recv_tokens = self.worker.num_recv_tokens.to_vec();
         let recv_len = combine_send_offset.len();
         let tokens_per_expert = self.worker.tokens_per_expert.to_vec();
+        let sum_tokens_per_expert = tokens_per_expert.iter().copied().sum::<u32>();
+        let num_recv_tokens_main = num_recv_tokens.first().copied().unwrap_or_default();
+        let num_recv_efa_tokens = num_recv_tokens.get(1).copied().unwrap_or_default();
+        let total_padded_tokens = tokens_per_expert
+            .iter()
+            .map(|&count| {
+                let count = count as usize;
+                count.div_ceil(self.expert_padding) * self.expert_padding
+            })
+            .sum::<usize>() as u32;
+        let recv_entries = max_recv_entries.unwrap_or(recv_len).min(recv_len);
+        let max_padded_index = padded_index.iter().take(recv_entries).copied().max();
+        let padded_index_out_of_bounds = padded_index
+            .iter()
+            .take(recv_entries)
+            .filter(|&&index| index >= total_padded_tokens)
+            .count();
 
         Ok(AllToAllDebugState {
             tokens_per_expert,
@@ -462,6 +503,12 @@ impl AllToAllContext {
             padded_index: padded_index[..max_recv_entries.unwrap_or(recv_len).min(recv_len)]
                 .to_vec(),
             num_recv_tokens,
+            sum_tokens_per_expert,
+            num_recv_tokens_main,
+            num_recv_efa_tokens,
+            total_padded_tokens,
+            max_padded_index,
+            padded_index_out_of_bounds,
         })
     }
 
