@@ -326,8 +326,13 @@ impl FabricEngine {
 impl Drop for FabricEngine {
     fn drop(&mut self) {
         self.stop();
+        let mut ctxs = Vec::new();
         while let Some((_, ctx)) = self.workers.pop_first() {
             ctx.worker.stop();
+            ctxs.push(ctx);
+        }
+        for ctx in ctxs {
+            ctx.worker.join();
         }
     }
 }
