@@ -10,6 +10,7 @@ use std::{
 
 use crossbeam_channel::TryRecvError;
 use cuda_lib::CudaHostMemory;
+use cuda_lib::rt::cudaSetDevice;
 use thread_lib::pin_cpu;
 use tracing::{debug, warn};
 
@@ -82,6 +83,7 @@ pub enum UvmWatcherCall {
 
 pub struct Worker {
     pub domain_list: Vec<DomainInfo>,
+    pub cuda_device: u8,
     pub pin_worker_cpu: Option<u16>,
     pub pin_uvm_cpu: Option<u16>,
 }
@@ -162,6 +164,7 @@ impl Worker {
                 1 => worker_thread_builder.spawn(move || {
                     rdma_worker_thread::<EfaDomain, 1>(
                         efa_domain_list,
+                        self.cuda_device,
                         self.pin_worker_cpu,
                         imm_count_map,
                         init_worker_tx,
@@ -171,6 +174,7 @@ impl Worker {
                 2 => worker_thread_builder.spawn(move || {
                     rdma_worker_thread::<EfaDomain, 2>(
                         efa_domain_list,
+                        self.cuda_device,
                         self.pin_worker_cpu,
                         imm_count_map,
                         init_worker_tx,
@@ -180,6 +184,7 @@ impl Worker {
                 4 => worker_thread_builder.spawn(move || {
                     rdma_worker_thread::<EfaDomain, 4>(
                         efa_domain_list,
+                        self.cuda_device,
                         self.pin_worker_cpu,
                         imm_count_map,
                         init_worker_tx,
@@ -197,6 +202,7 @@ impl Worker {
                 1 => worker_thread_builder.spawn(move || {
                     rdma_worker_thread::<VerbsDomain, 1>(
                         verbs_domain_list,
+                        self.cuda_device,
                         self.pin_worker_cpu,
                         imm_count_map,
                         init_worker_tx,
@@ -206,6 +212,7 @@ impl Worker {
                 2 => worker_thread_builder.spawn(move || {
                     rdma_worker_thread::<VerbsDomain, 2>(
                         verbs_domain_list,
+                        self.cuda_device,
                         self.pin_worker_cpu,
                         imm_count_map,
                         init_worker_tx,
@@ -227,7 +234,7 @@ impl Worker {
         let uvm_thread_builder =
             std::thread::Builder::new().name("tx_engine_uvm_worker".to_string());
         let uvm_handle = uvm_thread_builder
-            .spawn(move || uvm_worker_thread(self.pin_uvm_cpu, init_uvm_tx, cq_tx))
+            .spawn(move || uvm_worker_thread(self.cuda_device, self.pin_uvm_cpu, init_uvm_tx, cq_tx))
             .map_err(|_| FabricLibError::Custom("Failed to spawn UVM worker thread"))?;
 
         Ok(InitializingWorker {
@@ -341,11 +348,18 @@ impl UvmWatcherContext {
 
 fn rdma_worker_thread<D: RdmaDomain, const N: usize>(
     domain_list: Vec<D::Info>,
+    cuda_device: u8,
     maybe_pin_cpu: Option<u16>,
     imm_count_map: Arc<ImmCountMap>,
     init_tx: oneshot::Sender<Result<InitializedWorker>>,
     cq_tx: crossbeam_channel::Sender<TransferCompletionEntry>,
 ) {
+    if cudaSetDevice(cuda_device as i32).is_err() {
+        let _ = init_tx.send(Err(FabricLibError::Custom(
+            "Failed to set CUDA device on domain worker thread",
+        )));
+        return;
+    }
     // Pin CPU if specified
     if let Some(cpu) = maybe_pin_cpu {
         let names: Vec<_> = domain_list.iter().map(|info| info.name()).collect();
@@ -519,10 +533,17 @@ fn worker_step<D: RdmaDomain, const N: usize>(
 }
 
 fn uvm_worker_thread(
+    cuda_device: u8,
     maybe_pin_cpu: Option<u16>,
     init_tx: oneshot::Sender<Result<InitializedUvmWatcher>>,
     cq_tx: crossbeam_channel::Sender<TransferCompletionEntry>,
 ) {
+    if cudaSetDevice(cuda_device as i32).is_err() {
+        let _ = init_tx.send(Err(FabricLibError::Custom(
+            "Failed to set CUDA device on UVM worker thread",
+        )));
+        return;
+    }
     // Pin CPU if specified
     if let Some(cpu) = maybe_pin_cpu {
         debug!("Pin UVM Worker CPU {}", cpu);

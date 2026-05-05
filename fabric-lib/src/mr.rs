@@ -4,6 +4,7 @@ use cuda_lib::driver::cu_get_dma_buf_fd;
 use cuda_lib::rt::{cudaMemoryTypeDevice, cudaPointerGetAttributes};
 use cuda_lib::{CudaDeviceId, Device};
 use once_cell::sync::Lazy;
+use tracing::debug;
 
 use crate::error::{FabricLibError, Result};
 
@@ -26,18 +27,39 @@ impl MemoryRegion {
             Device::Host => Mapping::Host,
             Device::Cuda(device_id) => {
                 let attrs = cudaPointerGetAttributes(ptr)?;
+                debug!(
+                    ptr = ?ptr,
+                    len,
+                    requested_device = ?device_id,
+                    attrs = ?attrs,
+                    "cudaPointerGetAttributes"
+                );
                 if attrs.type_ != cudaMemoryTypeDevice {
                     return Err(FabricLibError::Custom("not a device pointer"));
                 }
                 let dmabuf_fd = if linux_kernel_supports_dma_buf() {
-       //             cu_get_dma_buf_fd(ptr, len).ok()
-                    None
+                //    cu_get_dma_buf_fd(ptr, len).ok()
+                    None // Force use of HMEM CUDA
                 } else {
                     None
                 };
                 Mapping::Device { device_id, dmabuf_fd }
             }
         };
+        debug!(
+            ptr = ?ptr,
+            len,
+            device = ?device,
+            mapping = ?mapping,
+            using_dmabuf = matches!(
+                mapping,
+                Mapping::Device {
+                    dmabuf_fd: Some(_),
+                    ..
+                }
+            ),
+            "constructed MemoryRegion"
+        );
         Ok(MemoryRegion { ptr, len, mapping })
     }
 
