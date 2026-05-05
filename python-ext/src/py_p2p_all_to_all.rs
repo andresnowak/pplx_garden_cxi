@@ -205,6 +205,14 @@ impl PyAllToAllContext {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    fn wait_ready(&self) {
+        self.ctx.wait_ready();
+    }
+
+    fn reset_counters(&self) {
+        self.ctx.reset_counters();
+    }
+
     #[pyo3(signature = (max_token_offsets=None, max_recv_entries=None))]
     fn debug_state<'py>(
         &self,

@@ -148,10 +148,15 @@ impl WorkerState {
         let source_rank = GdrVec::new(&gdr_context, max_recv_tokens)?;
         let source_dispatch_offset = GdrVec::new(&gdr_context, max_recv_tokens)?;
         let combine_send_offset = GdrVec::new(&gdr_context, max_recv_tokens)?;
-        let padded_index = GdrVec::new(&gdr_context, max_recv_tokens)?;
+        let padded_index: GdrVec<u32> = GdrVec::new(&gdr_context, max_recv_tokens)?;
         let num_recv_tokens = GdrVec::new(&gdr_context, 3)?;
 
         num_recv_tokens.copy(&[0u32, 0u32, 0u32]);
+        dispatch_route_done.set(false);
+        dispatch_send_done.set(false);
+        dispatch_recv_done.set(false);
+        combine_send_done.set(false);
+        combine_recv_done.set(false);
         num_recv_tokens_flag.set(false);
         dispatch_recv_flag.set(false);
         combine_recv_flag.set(false);
@@ -174,7 +179,7 @@ impl WorkerState {
 
 
         // Prepare the re-usable command to send out routing info.
-        
+
         let route_write_op = {
             // Send the expert counts, plus one, over to all peers.
             let mut dsts = Vec::with_capacity(world_size - 1);
@@ -301,6 +306,26 @@ impl WorkerState {
         })
     }
 
+    /// Reset all ImmCounters and GdrCounters to 0, and GPU-polled flags to false.
+    /// Must only be called when the worker is idle (tx_ready is true) and all
+    /// in-flight EFA operations from the previous cycle have fully completed.
+    pub fn reset_counters(&self) {
+        self.route_counter.reset();
+        self.dispatch_counter.reset();
+        self.combine_counter.reset();
+        self.dispatch_barrier_counter.reset();
+        self.combine_barrier_counter.reset();
+        // Reset GPU-polled flags so the next cycle's kernels don't see stale values.
+        self.dispatch_recv_flag.set(false);
+        self.combine_recv_flag.set(false);
+        self.num_recv_tokens_flag.set(false);
+        self.dispatch_route_done.set(false);
+        self.dispatch_send_done.set(false);
+        self.dispatch_recv_done.set(false);
+        self.combine_send_done.set(false);
+        self.combine_recv_done.set(false);
+    }
+
     fn is_running(&self) -> bool {
         !self.stop_flag.load(Ordering::Relaxed)
     }
@@ -404,12 +429,14 @@ impl WorkerState {
     fn step(&self) {
         // Wait for the device to copy the routing info to the host.
         self.dispatch_route_done.wait();
+
+        // Check if we are still running before proceeding with the all-to-all exchange.
         if !self.is_running() {
             return;
         }
 
         // pxz before exchanging routing info
-//        self.debug_num_routed(0);
+        // self.debug_num_routed(0);
 
         // Start exchanging routing info.
         self.transfer_engine
@@ -422,12 +449,14 @@ impl WorkerState {
         // Wait for the dispatch kernel to copy tokens into send buffers.
         self.dispatch_send_done.wait();
         self.tx_ready.set(false);
+
+        // Check if we are still running before proceeding with the all-to-all exchange.
         if !self.is_running() {
             return;
         }
 
 
-//        self.debug_num_routed(1);
+        // self.debug_num_routed(1);
 
         // Trigger transfers into private recv buffers.
         let num_private_ranges = self.dispatch_initial_routes();
@@ -439,14 +468,14 @@ impl WorkerState {
 
         let route = self.process_routing_info();
 
-//        self.debug_num_routed(2);
+        // self.debug_num_routed(2);
 
         // Register a callback to wait for the expected number of immediates.
         let num_shards = self.transfer_engine.nets_per_gpu().get() as u32;
         let num_dispatch_tx = 1
             + if num_private_ranges == 0 { 0 } else { 1 }
             + if route.dispatch_ranges.is_empty() { 0 } else { 1 };
-        let num_combine_tx = 1 + if self.world_size > self.node_size { 1 } else { 0 };
+        let num_combine_tx = 1 + if self.world_size > self.node_size { 1 } else { 0 }; // Barrier always and one possible combine scatter for inter-node communication.
         let num_combine_imm = (self.world_size - self.node_size) as u32 * num_shards;
 
         // Dispatch stage.
@@ -769,20 +798,8 @@ impl WorkerState {
         }
         route_group(self.dp_group);
 
-        //println!("worker: rank={:?}, num_recv_tokens={:?}, num_recv_efa_tokens={:?}", self.rank, num_recv_tokens, num_recv_efa_tokens);
-
         // Copy the buffers to the device.
-        if env::var("PPLX_DEBUG_SKIP_PADDED_INDEX_COPY").ok().as_deref() != Some("1") {
-            if let Some(fill_value) = env::var("PPLX_DEBUG_PADDED_INDEX_FILL")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-            {
-                let filled = vec![fill_value; padded_index.len()];
-                self.padded_index.copy(&filled);
-            } else {
-                self.padded_index.copy(&padded_index);
-            }
-        }
+        self.padded_index.copy(&padded_index);
         self.source_rank.copy(&source_rank);
         self.source_dispatch_offset.copy(&source_dispatch_offset);
         self.combine_send_offset.copy(&combine_send_offset);
