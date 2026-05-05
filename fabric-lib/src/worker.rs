@@ -360,6 +360,7 @@ fn rdma_worker_thread<D: RdmaDomain, const N: usize>(
         )));
         return;
     }
+
     // Pin CPU if specified
     if let Some(cpu) = maybe_pin_cpu {
         let names: Vec<_> = domain_list.iter().map(|info| info.name()).collect();
@@ -544,6 +545,7 @@ fn uvm_worker_thread(
         )));
         return;
     }
+
     // Pin CPU if specified
     if let Some(cpu) = maybe_pin_cpu {
         debug!("Pin UVM Worker CPU {}", cpu);

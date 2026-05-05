@@ -180,9 +180,10 @@ def _dump_kernel_debug_state(
         "[pplx-test-debug][rank=%d] %s kernel debug_state "
         "num_recv_tokens=%s expert_offsets=%s token_offset=%s padded_index=%s "
         "combine_send_offset=%s source_dispatch_offset=%s source_rank=%s "
-        "tokens_per_expert=%s sum_tokens_per_expert=%s "
-        "num_recv_tokens_main=%s num_recv_efa_tokens=%s total_padded_tokens=%s "
-        "max_padded_index=%s padded_index_out_of_bounds=%s",
+        "tokens_per_expert=%s ",
+        # "sum_tokens_per_expert=%s "
+        # "num_recv_tokens_main=%s num_recv_efa_tokens=%s total_padded_tokens=%s "
+        # "max_padded_index=%s padded_index_out_of_bounds=%s",
         rank,
         label,
         state["num_recv_tokens"],
@@ -193,12 +194,12 @@ def _dump_kernel_debug_state(
         state["source_dispatch_offset"],
         state["source_rank"],
         state["tokens_per_expert"],
-        state["sum_tokens_per_expert"],
-        state["num_recv_tokens_main"],
-        state["num_recv_efa_tokens"],
-        state["total_padded_tokens"],
-        state["max_padded_index"],
-        state["padded_index_out_of_bounds"],
+        # state["sum_tokens_per_expert"],
+        # state["num_recv_tokens_main"],
+        # state["num_recv_efa_tokens"],
+        # state["total_padded_tokens"],
+        # state["max_padded_index"],
+        # state["padded_index_out_of_bounds"],
     )
 
 
@@ -313,8 +314,8 @@ def _test_p2p_all_to_all_worker(
             #     node_group=node_group,
             #     global_group=global_group,
             # )
-            all_to_all.debug_poison_transport_buffers(value=0)
-            torch.cuda.synchronize()
+            # all_to_all.debug_poison_transport_buffers(value=0)
+            # torch.cuda.synchronize()
 
             expected_num_tokens = torch.sum(
                 torch.stack(
