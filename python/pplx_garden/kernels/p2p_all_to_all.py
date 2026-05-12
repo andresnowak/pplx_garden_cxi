@@ -326,7 +326,7 @@ class P2PAllToAll(AllToAllKernel):
         dp_x_scale: Optional[torch.Tensor],
         indices: torch.Tensor,
         weights: torch.Tensor,
-        bound_m: Optional[torch.Tensor] = None,
+        bound_m: Optional[torch.Tensor] = None, # Dynamic upper bound for tokens to send (instead of fixed max_num_tokens).
         do_send: bool = True,
         do_recv: bool = True,
         out_expert_prob: Optional[torch.Tensor] = None,
