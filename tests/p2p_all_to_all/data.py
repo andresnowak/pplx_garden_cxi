@@ -13,6 +13,7 @@ def rand_topk_idx(
     *,
     restrict_to_dp_group: bool = False,
     restrict_to_local_experts: bool = False,
+    exclude_dp_group: bool = False,
     dp_rank: int | None = None,
     dp_size: int | None = None,
     world_size: int | None = None,
@@ -38,6 +39,13 @@ def rand_topk_idx(
             dp_position = num_local_experts * dp_size * dp_rank
             scores[:, :dp_position] = float("-inf")
             scores[:, dp_position + num_local_experts * dp_size :] = float("-inf")
+    elif exclude_dp_group:
+        assert dp_rank is not None
+        assert dp_size is not None
+        assert world_size is not None
+        num_local_experts = num_experts // world_size
+        dp_position = num_local_experts * dp_size * dp_rank
+        scores[:, dp_position : dp_position + num_local_experts * dp_size] = float("-inf")
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
     return topk_idx.to(torch.uint32)
 
@@ -62,6 +70,7 @@ class RankTestData:
         *,
         restrict_to_dp_group: bool = False,
         restrict_to_local_experts: bool = False,
+        exclude_dp_group: bool = False,
         dp_rank: int | None = None,
         dp_size: int | None = None,
         world_size: int | None = None,
@@ -74,6 +83,7 @@ class RankTestData:
             device,
             restrict_to_dp_group=restrict_to_dp_group,
             restrict_to_local_experts=restrict_to_local_experts,
+            exclude_dp_group=exclude_dp_group,
             dp_rank=dp_rank,
             dp_size=dp_size,
             world_size=world_size,
@@ -105,6 +115,7 @@ class RankTestData:
         device: torch.device,
         restrict_to_dp_group: bool = False,
         restrict_to_local_experts: bool = False,
+        exclude_dp_group: bool = False,
     ) -> "RankTestData":
         assert num_experts_per_token <= num_experts
 
@@ -116,6 +127,7 @@ class RankTestData:
             device,
             restrict_to_dp_group=restrict_to_dp_group,
             restrict_to_local_experts=restrict_to_local_experts,
+            exclude_dp_group=exclude_dp_group,
             dp_rank=dp_rank,
             dp_size=dp_size,
             world_size=world_size,
@@ -144,7 +156,9 @@ class RankTestData:
             device=device,
             generator=generator,
         )
-        weights = weights / torch.sum(weights, dim=-1, keepdim=True) # each token gives uniform weight to its experts (for the calculation test)
+        weights = weights / torch.sum(weights, dim=-1, keepdim=True) # each token gives uniform weight to its experts (for the calculation test), so in the weighted sum test, the output should be the same as the unweighted sum.
+        # weight = 1 / num_experts_per_token
+        # weights.fill_(weight) # To see if we are grabbing the correct weights
 
         return cls(
             dp_x=dp_x,

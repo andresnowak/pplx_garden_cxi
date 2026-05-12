@@ -16,7 +16,6 @@
 using namespace rose;
 using namespace rose::device;
 
-
 template <unsigned NUM_WARPS, unsigned NODE_SIZE, typename T, typename U, typename NumExpertsPerToken>
 __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_kernel(
     const size_t token_dim,
@@ -51,9 +50,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     // Determine the number of tokens to combine on the current rank.
     const size_t num_send_tokens = bound_m_ptr ? *bound_m_ptr : num_tokens;
 
+    uint32_t *positions = reinterpret_cast<uint32_t *>(shared_memory);
+
     // In a first pass, copy the positions into shared memory.
     // This block processes tokens blockIdx.x + i * gridDim.x.
-    uint32_t *positions = reinterpret_cast<uint32_t *>(shared_memory);
     {
         uint32_t i = threadIdx.x;
         for (;;) {
@@ -91,8 +91,42 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     }
     __syncthreads();
 
+    // if (blockIdx.x == 0 && threadIdx.x == 0) {
+    //     printf("combine_recv visible recv_buffer rank=%u:", (unsigned)rank);
+    //     const unsigned max_slots = 36;
+    //     for (unsigned slot = 0; slot < max_slots; ++slot) {
+    //         auto *buffer = (T*)(recv_buffer + slot * token_dim);
+    //         printf(
+    //             " [%u]=[%f,%f,%f,%f]",
+    //             slot,
+    //             (double)buffer[0],
+    //             (double)buffer[1],
+    //             (double)buffer[2],
+    //             (double)buffer[3]
+    //         );
+    //     }
+    //     printf("\n");
+    // }
+
     for (unsigned token = blockIdx.x, local_token = 0; token < num_send_tokens; token += gridDim.x, local_token++) {
         U *dstPtr = out_tokens_ptr + token * out_tokens_stride;
+
+        // if (blockIdx.x == 0 && threadIdx.x == 0 && token < 2) {
+        //     printf("combine_recv routes rank=%u token=%u:", (unsigned)rank, (unsigned)token);
+        //     for (unsigned k = 0; k < num_experts_per_token; ++k) {
+        //         const uint32_t position = positions[local_token * num_experts_per_token + k];
+        //         const float weight = weights_ptr[token * weights_stride + k];
+        //         const uint32_t expert = indices_ptr[token * indices_stride + k];
+        //         printf(
+        //             " [route=%u expert=%u pos=%u weight=%.6f]",
+        //             k,
+        //             expert,
+        //             position,
+        //             weight
+        //         );
+        //     }
+        //     printf("\n");
+        // }
 
         NumExpertsPerToken experts_per_token_bound(num_experts_per_token);
         using VecTy = CombineVec<T, U>;
@@ -111,9 +145,27 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
                     const uint32_t position = positions[local_token * num_experts_per_token + k];
 
                     T *buffer = (T*)(recv_buffer + position * token_dim);
-                    acc.add(weight, SrcTy(buffer + j));
+                    const SrcTy src(buffer + j);
+                    // printf(
+                    //     "combine_recv input rank=%u token=%u route=%u position=%u j=%u value=%f weight=%f\n",
+                    //     (unsigned)rank,
+                    //     (unsigned)token,
+                    //     (unsigned)k,
+                    //     (unsigned)position,
+                    //     (unsigned)j,
+                    //     (double)src.v[0],
+                    //     (double)weight
+                    // );
+                    acc.add(weight, src);
                 }
 
+                // printf(
+                //     "combine_recv output rank=%u token=%u j=%u value=%f\n",
+                //     (unsigned)rank,
+                //     (unsigned)token,
+                //     (unsigned)j,
+                //     (double)acc.v.v[0]
+                // );
                 acc.store(dstPtr + j);
             }
         } else {
@@ -125,6 +177,13 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
             for (unsigned k = 0; k < NUM_EXPERTS; ++k) {
                 const uint32_t position = positions[local_token * num_experts_per_token + k];
                 tokens[k] = (T*)(recv_buffer + position * token_dim);
+                // printf(
+                //     "combine_recv recv_buffer rank=%u ptr=%p route=%u position=%u\n",
+                //     (unsigned)rank,
+                //     (void*)tokens[k],
+                //     (unsigned)k,
+                //     (unsigned)position
+                // );
                 weights[k] = weights_ptr[token * weights_stride + k];
             }
 

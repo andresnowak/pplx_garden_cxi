@@ -9,13 +9,13 @@
 #include <nvtx3/nvToolsExt.h>
 
 #include <cassert>
+#include <cstdio>
 #include <cstdint>
 
 #include <type_traits>
 
 using namespace rose;
 using namespace rose::device;
-
 
 template <unsigned NUM_WARPS, unsigned NODE_SIZE, unsigned DP_SIZE, typename TokenDim>
 __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_kernel(
@@ -52,7 +52,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
     std::byte *recv_ptrs_local[NODE_SIZE];
     #pragma unroll
     for (unsigned i = 0; i < NODE_SIZE; i++) {
-        recv_ptrs_local[i] = recv_ptrs[i];
+        recv_ptrs_local[i] = recv_ptrs[i]; // the recv buffer of each rank in the node
     }
 
     auto grid = cooperative_groups::this_grid();
@@ -131,6 +131,21 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
                 auto token_rank = local_stages[s].rank;
                 auto token_node = token_rank / NODE_SIZE;
                 if (token_node != rank_node) {
+                    // if (blockIdx.x == 0 && i == 0 && token + s * gridDim.x < 18) {
+                    //     const uint4 packed = values[s];
+                    //     printf(
+                    //         "combine_send efa rank=%u token=%u src_index=%u src_rank=%u dst_offset=%u vals=[%.6f,%.6f,%.6f,%.6f]\n",
+                    //         (unsigned)rank,
+                    //         (unsigned)(token + s * gridDim.x),
+                    //         (unsigned)local_stages[s].index,
+                    //         (unsigned)token_rank,
+                    //         (unsigned)offset,
+                    //         __uint_as_float(packed.x),
+                    //         __uint_as_float(packed.y),
+                    //         __uint_as_float(packed.z),
+                    //         __uint_as_float(packed.w)
+                    //     );
+                    // }
                     auto *x_token_dst = (uint4*)(send_buffer + offset * token_bound);
                     st_global_nc_uint4(&x_token_dst[i], values[s]);
                 }
@@ -194,37 +209,29 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
                 auto token_rank = local_stages[s].rank;
                 auto token_node = token_rank / NODE_SIZE;
                 if (token_node == rank_node) {
-                    unsigned first_peer = (token_rank / DP_SIZE) * DP_SIZE;
-                    // Copy the token into the recv buffer of the receiving node via NVLink.
-                    // if (threadIdx.x == 0 && i == 0) {
+                    // if (blockIdx.x == 0 && i == 0 && token + s * gridDim.x < 18) {
+                    //     const uint4 packed = values[s];
                     //     printf(
-                    //         "Token %u is local rank %llu. Copying to peers on the same node. Token rank: %u, first peer: %u\n",
-                    //         token + s * gridDim.x,
-                    //         (unsigned long long)rank,
-                    //         token_rank,
-                    //         first_peer
+                    //         "combine_send nvl rank=%u token=%u src_index=%u src_rank=%u dst_offset=%u first_peer=%u vals=[%.6f,%.6f,%.6f,%.6f]\n",
+                    //         (unsigned)rank,
+                    //         (unsigned)(token + s * gridDim.x),
+                    //         (unsigned)local_stages[s].index,
+                    //         (unsigned)token_rank,
+                    //         (unsigned)offset,
+                    //         (unsigned)((token_rank / DP_SIZE) * DP_SIZE),
+                    //         __uint_as_float(packed.x),
+                    //         __uint_as_float(packed.y),
+                    //         __uint_as_float(packed.z),
+                    //         __uint_as_float(packed.w)
                     //     );
                     // }
+                    unsigned first_peer = (token_rank / DP_SIZE) * DP_SIZE;
+                    // Copy the token into the recv buffer of the receiving node via NVLink.
                     #pragma unroll(DP_SIZE)
                     for (unsigned dp_peer = 0; dp_peer < DP_SIZE; dp_peer++) {
+                        // Do a fan out to all ranks in a DP group, as all ranks will want the same token from this rank (as they share the same data).
                         auto raw_peer = first_peer + dp_peer;
                         auto token_peer = raw_peer % NODE_SIZE;
-                        // if (threadIdx.x == 0 && i == 0) {
-                        //     printf(
-                        //         "thread %u stage %u rank %llu Copying token %u to raw peer %u -> local peer %u (token rank %u) at offset %u with first peer %u and DP_SIZE %u and NODE_SIZE %u\n",
-                        //         threadIdx.x,
-                        //         s,
-                        //         (unsigned long long)rank,
-                        //         token + s * gridDim.x,
-                        //         raw_peer,
-                        //         token_peer,
-                        //         token_rank,
-                        //         offset,
-                        //         first_peer,
-                        //         (unsigned)DP_SIZE,
-                        //         (unsigned)NODE_SIZE
-                        //     );
-                        // }
                         auto *x_token_dst = (uint4*)(recv_ptrs_local[token_peer] + offset * token_bound);
                         st_global_nc_uint4(&x_token_dst[i], values[s]); // Copy the same token to all DP peers on the same node
                     }

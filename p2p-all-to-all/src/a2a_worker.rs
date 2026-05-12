@@ -477,6 +477,7 @@ impl WorkerState {
             + if route.dispatch_ranges.is_empty() { 0 } else { 1 };
         let num_combine_tx = 1 + if self.world_size > self.node_size { 1 } else { 0 }; // Barrier always and one possible combine scatter for inter-node communication.
         let num_combine_imm = (self.world_size - self.node_size) as u32 * num_shards;
+        let debug_combine = env::var("PPLX_TEST_DEBUG_COMBINE_WORKER").ok().as_deref() == Some("1");
 
         // Dispatch stage.
         {
@@ -523,6 +524,29 @@ impl WorkerState {
             // Sent the tokens.
             let combine_range = range_start!("combine");
 
+            if debug_combine {
+                println!(
+                    "[pplx-worker-debug][rank={}] combine start ranges={} expected_imm={} world_size={} node_size={} num_shards={}",
+                    self.rank,
+                    route.combine_ranges.len(),
+                    num_combine_imm,
+                    self.world_size,
+                    self.node_size,
+                    num_shards,
+                );
+                for (i, dst) in route.combine_ranges.iter().enumerate() {
+                    println!(
+                        "[pplx-worker-debug][rank={}] combine range[{}] length={} src_offset={} dst_offset={} dst_mr={:?}",
+                        self.rank,
+                        i,
+                        dst.length,
+                        dst.src_offset,
+                        dst.dst_offset,
+                        dst.dst_mr,
+                    );
+                }
+            }
+
             if !route.combine_ranges.is_empty() {
                 self.transfer_engine
                     .submit_transfer_atomic(
@@ -540,11 +564,30 @@ impl WorkerState {
             }
 
             // Wait for all remote writes to complete.
+            if debug_combine {
+                println!(
+                    "[pplx-worker-debug][rank={}] combine waiting for imm count {}",
+                    self.rank,
+                    num_combine_imm,
+                );
+            }
             self.combine_counter.wait(num_combine_imm);
+            if debug_combine {
+                println!(
+                    "[pplx-worker-debug][rank={}] combine imm wait complete, setting combine_recv_flag",
+                    self.rank,
+                );
+            }
             self.combine_recv_flag.set(true);
 
             // Let the recv phase output the tokens and proceed forward.
             self.combine_recv_done.wait();
+            if debug_combine {
+                println!(
+                    "[pplx-worker-debug][rank={}] combine recv done observed",
+                    self.rank,
+                );
+            }
 
             range_end!(combine_range);
         }
@@ -582,7 +625,9 @@ impl WorkerState {
         }
 
         for peer_node in 1..(self.world_size / self.node_size) {
-            for index in 0..self.node_size {
+            // Dispatch ownership is sharded by DP lane, so only send the
+            // private remote prefix to matching-lane ranks on remote nodes.
+            for index in (self.dp_rank..self.node_size).step_by(self.dp_size) {
                 let peer_rank = ((rank_node + peer_node) * self.node_size + index)
                     % self.world_size;
                 let num_tokens =
@@ -644,8 +689,8 @@ impl WorkerState {
         // On the sender side, find the start offset of each expert.
         let nets_per_gpu = self.transfer_engine.nets_per_gpu().get() as u32;
         let mut tokens_from_group = vec![0; num_dp_groups];
-        let mut src_group_offset = vec![0; num_dp_groups];
-        let mut dst_group_offset = vec![0; num_dp_groups];
+        let mut src_group_offset = vec![0; num_dp_groups]; // Cumulative count of tokens contributed by earlier peer groups to this ranks local experts
+        let mut dst_group_offset = vec![0; num_dp_groups]; // is the prefix sum of tokens for experts before this ranks local experts, inside one peer group (peer group = set of ranks that share the same dp_group and thus have the same routing decisions, but may be on different nodes)
         let mut tokens_per_expert = vec![0; experts_per_rank];
         let mut num_recv_tokens = 0;
         let mut num_recv_tx = 0;
@@ -658,14 +703,14 @@ impl WorkerState {
                 let group_node = dp_group / groups_per_node;
                 let mut num_tokens = 0usize;
                 for i in 0..self.dp_size {
-                    let rank = dp_group * self.dp_size + i;
+                    let rank = dp_group * self.dp_size + i; // Global rank in this dp group.
                     dispatch_src_offset[rank] = rank_offset;
 
                     let first_expert = rank * experts_per_rank;
                     let last_expert =
                         (first_expert + experts_per_rank).min(self.num_experts);
                     for expert in first_expert..last_expert {
-                        let n = self.get_num_routed(self.dp_group, expert);
+                        let n = self.get_num_routed(self.dp_group, expert); // Number of tokens routed to this expert on the local rank.
                         source_expert_offset[expert] = rank_offset;
                         tokens_to_rank[rank] += n;
                         rank_offset += n;
@@ -719,15 +764,15 @@ impl WorkerState {
         let base_offset = (self.max_private_tokens * num_dp_groups) as u64;
 
         let mut last = 0;
-        let mut src_dispatch_count = vec![0; num_dp_groups];
-        let mut src_combine_count = vec![0; num_dp_groups];
-        let mut expert_count = vec![0usize; num_local_experts];
+        let mut src_dispatch_count = vec![0; num_dp_groups]; // Count of tokens that have been selected from the local rank for each peer group, used for calculating offsets in the local rank's send buffer.
+        let mut src_combine_count = vec![0; num_dp_groups]; // Count of tokens that need to be sent to remote ranks in the combine stage, used for calculating offsets in the remote rank's recv buffer.
+        let mut expert_count = vec![0usize; num_local_experts]; // Count of tokens for each local expert, used for calculating the padded index.
 
         let mut route_group = |peer_group: usize| {
             let mut num_routed = 0;
             for expert in first_local_expert..last_local_expert {
                 let private_offset = (self.max_private_tokens * peer_group) as u32;
-                let routed = self.get_num_routed(peer_group, expert);
+                let routed = self.get_num_routed(peer_group, expert); // Number of tokens for this expert that need to be sent to the peer group.
                 num_routed += routed as usize;
 
                 let local_expert = expert - first_local_expert;
@@ -735,12 +780,13 @@ impl WorkerState {
                 let src_offset = src_group_offset[peer_group];
                 let dst_offset = dst_group_offset[peer_group];
 
-                let peer_rank = peer_group * self.dp_size + self.dp_rank;
+                let peer_rank = peer_group * self.dp_size + self.dp_rank; // Our peer rank always has the same dp_rank in the other dp_group, because ranks in the same dp_group share data and routing decisions.
                 for _ in 0..routed {
                     if peer_rank == self.rank {
                         let local_offset = source_expert_offset[expert];
                         source_expert_offset[expert] += 1;
                         source_dispatch_offset[last] = local_offset;
+                        // println!("Source dispatch offset for local token, rank={:?}, peer_rank={:?}, peer_group={:?}, expert={:?}, local_expert={:?}, source_dispatch_offset={:?}, last={:?}", self.rank, peer_rank, peer_group, expert, local_expert, source_dispatch_offset[last], last);
                         combine_send_offset[last] = local_offset;
                     } else {
                         let index_on_rank = src_dispatch_count[peer_group];
@@ -751,23 +797,97 @@ impl WorkerState {
                         if (index_on_rank as usize) < self.max_private_tokens {
                             source_dispatch_offset[last] =
                                 private_offset + index_on_rank;
+                            // println!(
+                            //     "Source dispatch offset for remote token within private buffer, rank={:?}, peer_rank={:?}, peer_group={:?}, expert={:?}, local_expert={:?}, index_on_rank={:?}, private_offset={:?}, source_dispatch_offset={:?}, last={:?}",
+                            //     self.rank,
+                            //     peer_rank,
+                            //     peer_group,
+                            //     expert,
+                            //     local_expert,
+                            //     index_on_rank,
+                            //     private_offset,
+                            //     source_dispatch_offset[last],
+                            //     last
+                            // );
                         } else if peer_rank / self.node_size == rank_node {
                             source_dispatch_offset[last] =
-                                (dst_offset + index_on_rank) | (1 << 31);
+                                (dst_offset + index_on_rank) | (1 << 31); // set the high bit to indicate local combine?
+                            // println!(
+                            //     "Source dispatch offset for remote token within local node, rank={:?}, peer_rank={:?}, peer_group={:?}, expert={:?}, local_expert={:?}, index_on_rank={:?}, private_offset={:?}, source_dispatch_offset={:?}, last={:?}",
+                            //     self.rank,
+                            //     peer_rank,
+                            //     peer_group,
+                            //     expert,
+                            //     local_expert,
+                            //     index_on_rank,
+                            //     private_offset,
+                            //     source_dispatch_offset[last],
+                            //     last
+                            // );
                         } else {
                             source_dispatch_offset[last] = src_offset
                                 + index_on_rank
                                 + (base_offset as u32 - self.max_private_tokens as u32);
+                            // println!(
+                            //     "Source dispatch offset for remote token within remote node, rank={:?}, peer_rank={:?},
+                            //     peer_group={:?}, expert={:?}, local_expert={:?}, index_on_rank={:?}, private_offset={:?}, source_dispatch_offset={:?}, last={:?}",
+                            //     self.rank,
+                            //     peer_rank,
+                            //     peer_group,
+                            //     expert,
+                            //     local_expert,
+                            //     index_on_rank,
+                            //     private_offset,
+                            //     source_dispatch_offset[last],
+                            //     last
+                            // );
                         }
                     }
 
+                    // When dp_size > 1, even the self-group must be remapped into the
+                    // group-ordered combine layout instead of reusing local expert offsets.
                     if peer_rank != self.rank || self.dp_size > 1 {
                         let combine_index = src_combine_count[peer_group];
                         src_combine_count[peer_group] += 1;
+                        // println!(
+                        //     "combine remap, rank={:?}, peer_rank={:?}, peer_group={:?}, expert={:?}, local_expert={:?}, combine_index={:?}, source_dispatch_offset={:?}, combine_send_offset_before={:?}",
+                        //     self.rank,
+                        //     peer_rank,
+                        //     peer_group,
+                        //     expert,
+                        //     local_expert,
+                        //     combine_index,
+                        //     source_dispatch_offset[last],
+                        //     combine_send_offset[last]
+                        // );
                         if peer_rank / self.node_size == rank_node {
+                            let combine_send_offset_before = combine_send_offset[last];
                             combine_send_offset[last] = dst_offset + combine_index;
+                            // println!(
+                            //     "local combine, rank={:?}, peer_rank={:?}, peer_group={:?}, expert={:?}, local_expert={:?}, combine_index={:?}, source_dispatch_offset={:?}, combine_send_offset_after={:?}, combine_send_offset_before={:?}",
+                            //     self.rank,
+                            //     peer_rank,
+                            //     peer_group,
+                            //     expert,
+                            //     local_expert,
+                            //     combine_index,
+                            //     source_dispatch_offset[last],
+                            //     combine_send_offset[last],
+                            //     combine_send_offset_before
+                            // );
                         } else {
                             combine_send_offset[last] = src_offset + combine_index;
+                            // println!(
+                            //     "remote combine, rank={:?}, peer_rank={:?}, peer_group={:?}, expert={:?}, local_expert={:?}, combine_index={:?}, source_dispatch_offset={:?}, combine_send_offset={:?}",
+                            //     self.rank,
+                            //     peer_rank,
+                            //     peer_group,
+                            //     expert,
+                            //     local_expert,
+                            //     combine_index,
+                            //     source_dispatch_offset[last],
+                            //     combine_send_offset[last]
+                            // );
                         }
                     }
                     source_rank[last] = peer_rank as u32;
@@ -851,14 +971,11 @@ impl WorkerState {
                     ((rank_node + peer_node) * groups_per_node + index) % num_dp_groups;
                 for index in 0..self.dp_size {
                     let token_dim = self.get_combine_token_dim();
-
                     let peer_rank = peer_group * self.dp_size + index;
                     let length = token_dim * tokens_from_group[peer_group] as usize;
 
-                    let src_offset =
-                        src_group_offset[peer_group] as u64 * token_dim as u64;
-                    let dst_offset =
-                        dst_group_offset[peer_group] as u64 * token_dim as u64;
+                    let src_offset = src_group_offset[peer_group] as u64 * token_dim as u64;
+                    let dst_offset = dst_group_offset[peer_group] as u64 * token_dim as u64;
 
                     let dst_mr = self.rank_handles[peer_rank].recv_buffer_desc.clone();
                     combine_ranges.push(ScatterTarget {

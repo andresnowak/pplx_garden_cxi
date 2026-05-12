@@ -7,6 +7,7 @@ from typing import Optional
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from pplx_garden.distributed import ParallelGroup, ParallelLaunch
 from pplx_garden.kernels.p2p_all_to_all import P2PAllToAll
@@ -61,6 +62,7 @@ class _Config:
     nvlink_group: Optional[int]
     restrict_to_dp_group: bool = False
     restrict_to_local_experts: bool = False
+    exclude_dp_group: bool = False
     repetitions: int = 4
     id: str = ""
 
@@ -134,13 +136,14 @@ def _decode_dispatch_trailers(
             token_info = position_to_token.get(position, (-1, -1))
             tok_idx, expert_choice = token_info
             log.warning(
-                "[rank=%d][%s] dispatch trailer buf_pos=%d -> expert=%d, dst_rank=%d, expert_offset=%d, weight=%.3f, src_token_idx=%d, expert_choice_k=%d",
+                "[rank=%d][%s] dispatch trailer buf_pos=%d -> expert=%d, dst_rank=%d, expert_offset=%d (unreliable), position=%d (unreliable), weight=%.3f, src_token_idx=%d (unreliable), expert_choice_k=%d (unreliable)",
                 rank,
                 label,
                 pos,
                 expert,
                 dst_rank,
                 offset,
+                position,
                 weight,
                 tok_idx,
                 expert_choice,
@@ -203,6 +206,36 @@ def _dump_kernel_debug_state(
     )
 
 
+def _dump_combine_recv_buffer(
+    all_to_all: P2PAllToAll,
+    rank: int,
+    label: str,
+    *,
+    max_slots: int = 36,
+) -> None:
+    slot_width = all_to_all._hidden_dim
+    flat = all_to_all._recv_buffer_mapping.to_tensor(
+        (all_to_all._recv_buffer_mapping.size // all_to_all._out_dtype.itemsize,),
+        all_to_all._out_dtype,
+    )
+    num_slots = min(max_slots, flat.numel() // slot_width)
+    if num_slots == 0:
+        logger.warning(
+            "[pplx-test-debug][rank=%d] %s recv_buffer is empty",
+            rank,
+            label,
+        )
+        return
+
+    slots = flat[: num_slots * slot_width].view(num_slots, slot_width).cpu()
+    logger.warning(
+        "[pplx-test-debug][rank=%d] %s recv_buffer_slots=%s",
+        rank,
+        label,
+        slots.tolist(),
+    )
+
+
 def _test_p2p_all_to_all_worker(
     device: torch.device,
     tp_group: Optional[ParallelGroup],
@@ -251,6 +284,7 @@ def _test_p2p_all_to_all_worker(
             device=device,
             restrict_to_dp_group=config.restrict_to_dp_group,
             restrict_to_local_experts=config.restrict_to_local_experts,
+            exclude_dp_group=config.exclude_dp_group,
         )
         for rank_data in range(
             num_dp_groups
@@ -258,6 +292,43 @@ def _test_p2p_all_to_all_worker(
     ]
     local_rank = rank_data[dp_rank]  # we grab the data from our rank's dp_group
     ref_out_tokens = _act(local_rank.dp_x, local_rank.dp_x_scale).to(out_dtype)
+    print(f"[rank{global_group.rank}, local_rank.dp_x: {local_rank.dp_x.tolist()}, ref_out_tokens: {ref_out_tokens.tolist()}")
+
+    # Sanity check that the local input tokens are the same across TP ranks since we rely on that for correctness. If this fails, it means there's a bug in our test data generation logic for TP.
+    tp_local_tokens = [
+        torch.empty((max_num_tokens, hidden_dim), dtype=in_dtype, device=device)
+        for _ in range(tp_group.size)
+    ]
+    dist.all_gather(tp_local_tokens, local_rank.dp_x, group=tp_group._device_group)
+    if tp_group.size == 2:
+        print("Gathered local dp_x across TP ranks for debugging...")
+        assert torch.allclose(
+            tp_local_tokens[0], tp_local_tokens[1]
+        ), f"dp_x mismatch across tp ranks: {tp_local_tokens[0]} vs {tp_local_tokens[1]}"
+
+    tp_local_weights = [
+        torch.empty((max_num_tokens, num_experts_per_token), dtype=torch.float32, device=device)
+        for _ in range(tp_group.size)
+    ]
+    dist.all_gather(tp_local_weights, local_rank.weights, group=tp_group._device_group)
+    if tp_group.size == 2:
+        print("Gathered local weights across TP ranks for debugging...")
+        assert torch.allclose(
+            tp_local_weights[0], tp_local_weights[1]
+        ), f"weights mismatch across tp ranks: {tp_local_weights[0]} vs {tp_local_weights[1]}"
+
+    tp_local_indices = [
+         torch.empty((max_num_tokens, num_experts_per_token), dtype=torch.int32, device=device)
+         for _ in range(tp_group.size)
+     ]
+    dist.all_gather(tp_local_indices, local_rank.indices.to(torch.int32), group=tp_group._device_group)
+    if tp_group.size == 2:
+        print("Gathered local indices across TP ranks for debugging...")
+        assert torch.allclose(
+            tp_local_indices[0], tp_local_indices[1]
+        ), f"indices mismatch across tp ranks: {tp_local_indices[0]} vs {tp_local_indices[1]}"
+
+    # –---------------------
 
     node_group: Optional[ParallelGroup]
     if config.nvlink_group is not None:
@@ -314,7 +385,7 @@ def _test_p2p_all_to_all_worker(
             #     node_group=node_group,
             #     global_group=global_group,
             # )
-            # all_to_all.debug_poison_transport_buffers(value=0)
+            all_to_all.debug_poison_transport_buffers(value=0)
             # torch.cuda.synchronize()
 
             expected_num_tokens = torch.sum(
@@ -402,37 +473,41 @@ def _test_p2p_all_to_all_worker(
                     flush=True,
                 )
 
-            # ---------------------
-
-            # local_num_tokens = expert_num_tokens.sum().item()
-
-            # This test for TP is not correct
-            # if tp_group != None and tp_group.size > 1 and local_num_tokens > 0:
-            #     try:
-            #         print("Gathering out_expert_x for debugging...")
-            #         all_out_expert_x = [torch.empty_like(out_expert_x) for _ in range(tp_group.size)]
-            #         torch.distributed.all_gather(all_out_expert_x, out_expert_x, group=tp_group._device_group)
-
-            #         for i in range(tp_group.size):
-            #             print(
-            #                 f"rank {torch.distributed.get_rank()} Comparing gathered out_expert_x from rank {i} on dp_rank {dp_rank}...\n out_expert_x (shape: {out_expert_x.shape}) mean={out_expert_x.mean().item():.4f} std={out_expert_x.std().item():.4f} min={out_expert_x.min().item():.4f} max={out_expert_x.max().item():.4f} values={out_expert_x.tolist()}\n vs \n all_out_expert_x[{i}] (shape: {all_out_expert_x[i].shape}) mean={all_out_expert_x[i].mean().item():.4f} std={all_out_expert_x[i].std().item():.4f} min={all_out_expert_x[i].min().item():.4f} max={all_out_expert_x[i].max().item():.4f} values={all_out_expert_x[i].tolist()}",
-            #             )
-
-            #             (
-            #                 torch.testing.assert_close(all_out_expert_x[i], out_expert_x),
-            #                 f"Mismatch in gathered out_expert_x on rank {dp_rank} from rank {i}",
-            #             )
-            #     except AssertionError as e:
-            #         print(f"rank {torch.distributed.get_rank()} Error in gathered out_expert_x on dp_rank {dp_rank} from rank {i} at repetition {rep + 1}/{repetitions}. \n Error: {e}.", flush=True)
 
             expert_y = _act(out_expert_x, out_expert_x_scale).to(out_dtype)
-            all_to_all.combine(
-                out_tokens=out_tokens,
-                indices=local_rank.indices,
-                weights=local_rank.weights,
-                expert_y=expert_y,
-                bound_m=local_rank.bound_m,
-            )
+            if os.environ.get("PPLX_TEST_DEBUG_RECV_BUFFER") == "1":
+                all_to_all.combine(
+                    out_tokens=out_tokens,
+                    indices=local_rank.indices,
+                    weights=local_rank.weights,
+                    expert_y=expert_y,
+                    bound_m=local_rank.bound_m,
+                    do_send=True,
+                    do_recv=False,
+                )
+                torch.cuda.synchronize()
+                _dump_combine_recv_buffer(
+                    all_to_all,
+                    global_group.rank,
+                    f"after-combine-send rep={rep + 1}",
+                )
+                all_to_all.combine(
+                    out_tokens=out_tokens,
+                    indices=local_rank.indices,
+                    weights=local_rank.weights,
+                    expert_y=expert_y,
+                    bound_m=local_rank.bound_m,
+                    do_send=False,
+                    do_recv=True,
+                )
+            else:
+                all_to_all.combine(
+                    out_tokens=out_tokens,
+                    indices=local_rank.indices,
+                    weights=local_rank.weights,
+                    expert_y=expert_y,
+                    bound_m=local_rank.bound_m,
+                )
             torch.cuda.synchronize()
 
             # Verify the token counts.
@@ -442,8 +517,8 @@ def _test_p2p_all_to_all_worker(
             )
 
             # Verify the tokens.
-            def hash_token(x: torch.Tensor) -> str:
-                return ",".join(f"{v:.2f}" for v in x.tolist())
+            def hash_token(x: torch.Tensor, decimals: int = 6) -> str:
+                return ",".join(f"{v:.{decimals}f}" for v in x.tolist())
 
             tokens_on_rank = set()
             index = 0
@@ -452,7 +527,7 @@ def _test_p2p_all_to_all_worker(
                     tokens_on_rank.add(hash_token(token))
                 index = round_up(index + n, config.expert_padding)
 
-            # Verify the tokens on the rank.
+            # Verify the tokens on the rank after dispatch if we are missing any.
             num_missing = 0
             for i, (token, routes) in enumerate(
                 zip(list(local_rank.dp_x), local_rank.indices.tolist())
@@ -496,6 +571,7 @@ def _test_p2p_all_to_all_worker(
                     ] += 1
                 index = round_up(index + n, config.expert_padding)
 
+            # If the dispatch was wrong (we didn't get the expected tokens) this should raise
             if received_token_probs != expected_token_probs:
                 extra = received_token_probs - expected_token_probs
                 missing = expected_token_probs - received_token_probs
@@ -560,6 +636,41 @@ def _test_p2p_all_to_all_worker(
                 )
                 assert received_token_probs == expected_token_probs
 
+            # The next assert can fail sometimes even though the result was correct
+            # # Verify that the multiset of output tokens matches reference,
+            # # regardless of ordering. If this passes but assert_close fails,
+            # # the correct tokens are present but in the wrong positions.
+            # out_token_counts = Counter(hash_token(row, decimals=3) for row in out_tokens)
+            # ref_token_counts = Counter(hash_token(row, decimals=3) for row in ref_out_tokens)
+            # if out_token_counts != ref_token_counts:
+            #     missing_toks = ref_token_counts - out_token_counts
+            #     extra_toks = out_token_counts - ref_token_counts
+            #     msg_parts = [f"Combine output token multiset mismatch on rank: {global_group.rank}, dp_rank: {dp_rank}, at repetition {rep + 1}/{repetitions}:"]
+            #     if missing_toks:
+            #         msg_parts.append(f"  MISSING ({len(missing_toks)} distinct tokens):")
+            #         for tok, cnt in list(missing_toks.items())[:20]:
+            #             msg_parts.append(f"    token={tok[:40]}  count={cnt}")
+            #     if extra_toks:
+            #         msg_parts.append(f"  EXTRA ({len(extra_toks)} distinct tokens):")
+            #         for tok, cnt in list(extra_toks.items())[:20]:
+            #             msg_parts.append(f"    token={tok[:40]}  count={cnt}")
+            #     # Check if extra tokens belong to another dp rank's reference output.
+            #     other_rank_token_sets = {
+            #         other_dp_rank: Counter(
+            #             hash_token(_act(rank_data[other_dp_rank].dp_x, rank_data[other_dp_rank].dp_x_scale).to(out_dtype)[i], decimals=3)
+            #             for i in range(rank_data[other_dp_rank].dp_x.shape[0])
+            #         )
+            #         for other_dp_rank in range(num_dp_groups)
+            #         if other_dp_rank != dp_rank
+            #     }
+            #     for other_dp_rank, other_counts in other_rank_token_sets.items():
+            #         overlap = extra_toks & other_counts
+            #         if overlap:
+            #             msg_parts.append(
+            #                 f"  EXTRA tokens match dp_rank={other_dp_rank} reference ({len(overlap)} tokens) — combine returned wrong rank's data!"
+            #             )
+            #     raise AssertionError("\n".join(msg_parts))
+
             # Verify the combine output.
             try:
                 torch.testing.assert_close(out_tokens, ref_out_tokens)
@@ -597,14 +708,14 @@ def _test_p2p_all_to_all_worker(
                 flush=True,
             )
 
-            global_group.barrier()
-            # all_to_all.destroy() # NOTE: Fixes the problem if we also create a new all_to_all at the beginning of the loop
+            # global_group.barrier()
+            # # all_to_all.destroy() # NOTE: Fixes the problem if we also create a new all_to_all at the beginning of the loop
 
-            # TODO: Still don't know if this is necessary
+            # # TODO: Still don't know if this is necessary
             assert all_to_all._all_to_all is not None
-            all_to_all._all_to_all.wait_ready()
-            all_to_all._global_group.barrier()
-            all_to_all._all_to_all.reset_counters()
+            # all_to_all._all_to_all.wait_ready()
+            all_to_all._global_group.barrier() # TODO: you need a barrier because we need to wait for all ranks to have recv their tokens in the combine and read them for the test before starting a new dispatch that can rewrite the buffer
+            # all_to_all._all_to_all.reset_counters()
 
     except Exception:
         logger.exception("All-to-all failed")
@@ -678,22 +789,22 @@ def _test_p2p_all_to_all_moe_roundtrip_worker(
     )
 
     try:
-        expert_num_tokens = torch.empty(
+        expert_num_tokens = torch.zeros(
             (num_local_experts,),
             dtype=torch.int32,
             device=device,
         )
-        out_expert_x = torch.empty(
+        out_expert_x = torch.zeros(
             (max_recv_tokens, config.hidden_dim),
             dtype=config.in_dtype,
             device=device,
         )
-        out_expert_prob = torch.empty(
+        out_expert_prob = torch.zeros(
             (max_recv_tokens,),
             dtype=torch.float32,
             device=device,
         )
-        out_tokens = torch.empty(
+        out_tokens = torch.zeros(
             (config.max_num_tokens, config.hidden_dim),
             dtype=config.out_dtype,
             device=device,
@@ -975,11 +1086,11 @@ def _test_p2p_all_to_all_moe_roundtrip_worker(
                 world_size=4,
                 dp_size=2,
                 nets_per_gpu=1,
-                max_num_tokens=256,
+                max_num_tokens=1024,
                 num_experts=4,
                 hidden_dim=8,
                 hidden_dim_scale=None,
-                max_private_tokens=4096,  # max_num_tokens * num_experts_per_token * num_local_epxerts * dp_size
+                max_private_tokens=None,
                 num_experts_per_token=1,
                 in_dtype=torch.bfloat16,
                 out_dtype=torch.bfloat16,
@@ -991,9 +1102,6 @@ def _test_p2p_all_to_all_moe_roundtrip_worker(
             marks=[
                 mark_ci_4gpu,
                 pytest.mark.skipif(not has_tp(4), reason="Requires 4 devices"),
-                pytest.mark.skip(
-                    reason="This configuration seems to be invalid or unstable, needs investigation"
-                ),
             ],
             id="TP4-DP2-NIC1-BF16-T1024",
         ),
@@ -1088,19 +1196,18 @@ def _test_p2p_all_to_all_moe_roundtrip_worker(
                 num_experts=4,
                 hidden_dim=4,
                 hidden_dim_scale=None,
-                max_private_tokens=None,
+                max_private_tokens=256,
                 num_experts_per_token=4,
                 in_dtype=torch.float32,
                 out_dtype=torch.float32,
                 scale_dtype=None,
                 expert_padding=1,
                 nvlink_group=2,
+                # restrict_to_dp_group=True,
+                # exclude_dp_group=True,
             ),
             marks=[
                 pytest.mark.skipif(not has_tp(4), reason="Requires 4 devices"),
-                pytest.mark.skip(
-                    reason="This configuration fails on first repetition, seems DP fails with high max num tokens"
-                ),
             ],
             id="TP4-DP2-NVL2-T256",
         ),
@@ -1124,7 +1231,6 @@ def _test_p2p_all_to_all_moe_roundtrip_worker(
             marks=[pytest.mark.skipif(not has_tp(4), reason="Requires 4 devices")],
             id="TP4-DP1-NVL4",
         ),
-        # NOTE: It seems it doesn't like NVL = DP_size, but this should be valid because we want the ETP and EP in that node to be NVLink, so I'm not sure what this is doing
         pytest.param(
             _Config(
                 world_size=4,
@@ -1144,9 +1250,6 @@ def _test_p2p_all_to_all_moe_roundtrip_worker(
             ),
             marks=[
                 pytest.mark.skipif(not has_tp(4), reason="Requires 4 devices"),
-                pytest.mark.skip(
-                    reason="This configuration fails on first repetition, seems DP fails with high max num tokens"
-                ),
             ],
             id="TP4-DP2-NVL4",
         ),
@@ -1169,9 +1272,6 @@ def _test_p2p_all_to_all_moe_roundtrip_worker(
             ),
             marks=[
                 pytest.mark.skipif(not has_tp(4), reason="Requires 4 devices"),
-                pytest.mark.skip(
-                    reason="This configuration fails on first repetition, seems DP fails with high max num tokens"
-                ),
             ],
             id="TP4-DP2-NVL4-T1024",
         ),

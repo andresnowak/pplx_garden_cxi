@@ -168,13 +168,6 @@ void a2a_dispatch_recv_kernel(
             }
         }
         if (threadIdx.x == 0 && out_prob_ptr) {
-            if (meta_src->weight < 0.0f || meta_src->weight > 1.0f) {
-                printf(
-                    "dispatch_recv BAD_WEIGHT rank=%u token=%u padded_token=%u position=%u weight=%f token_stride=%zu\n",
-                    (unsigned)rank, (unsigned)token, (unsigned)padded_token,
-                    (unsigned)position, meta_src->weight, token_stride
-                );
-            }
             out_prob_ptr[padded_token] = meta_src->weight;
         }
     }
@@ -236,16 +229,8 @@ void a2a_dispatch_recv_kernel(
                 }
             }
             if (threadIdx.x == 0 && out_prob_ptr) {
-                if (meta_src->weight < 0.0f || meta_src->weight > 1.0f) {
-                    printf(
-                        "dispatch_recv BAD_WEIGHT_EFA rank=%u token=%u padded_token=%u weight=%f token_stride=%zu\n",
-                        (unsigned)rank, (unsigned)token, (unsigned)padded_token,
-                        meta_src->weight, token_stride
-                    );
-                }
                 out_prob_ptr[padded_token] = meta_src->weight;
             }
-
             token += gridDim.x;
             num_local_tokens++;
         }
