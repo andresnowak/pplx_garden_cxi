@@ -185,13 +185,27 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         }
         __syncthreads();
 
-        for (uint32_t i = threadIdx.x; i < num_send_tokens * num_experts_per_token_bound; i += blockDim.x) {
-            const uint32_t token = i / num_experts_per_token_bound;
-            const uint32_t index = i % num_experts_per_token_bound;
-            const uint32_t expert = __ldg(&indices[token * indices_stride + index]);
+        if (dp_size > 1) {
+            // DP peers must agree on the expert-local row order, because in combine_send we will do a fanout to a contiguous slice, that all ranks in the recv dp group will read from.
+            // Build token_offset deterministically from token-major order so every rank in the DP group reconstructs the same layout.
+            // TODO: So for now the DP fix makes DP configurations slower as it can't use all threads of the block to do the token sending decisions.
+            if (threadIdx.x == 0) {
+                for (uint32_t i = 0; i < num_send_tokens * num_experts_per_token_bound; ++i) {
+                    const uint32_t token = i / num_experts_per_token_bound;
+                    const uint32_t index = i % num_experts_per_token_bound;
+                    const uint32_t expert = indices[token * indices_stride + index];
+                    token_offset[i] = tokens_per_expert[expert]++;
+                }
+            }
+        } else {
+            for (uint32_t i = threadIdx.x; i < num_send_tokens * num_experts_per_token_bound; i += blockDim.x) {
+                const uint32_t token = i / num_experts_per_token_bound;
+                const uint32_t index = i % num_experts_per_token_bound;
+                const uint32_t expert = __ldg(&indices[token * indices_stride + index]);
 
-            // Assign an offset to the token within the current rank and expert.
-            token_offset[i] = atomicAdd(&tokens_per_expert[expert], 1);
+                // Assign an offset to the token within the current rank and expert.
+                token_offset[i] = atomicAdd(&tokens_per_expert[expert], 1);
+            }
         }
         __syncthreads();
 
@@ -201,23 +215,11 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         const uint32_t num_warps = ceil_div<size_t>(num_experts, WARP_SIZE);
         uint32_t *expert_sums = (uint32_t*)shared_memory;
 
-        uint32_t *local_num_routed = num_routed + dp_group * num_experts;
+        uint32_t *local_num_routed = num_routed + dp_group * num_experts; // Each group of dp_size ranks will write to a separate region in num_routed to avoid write conflicts, and the consumer will sum across the dp group to get the total count for each expert.
         uint32_t expert_offset = 0;
         if (i < num_experts) {
             expert_offset = tokens_per_expert[i];
-            local_num_routed[i] = expert_offset;
-            // printf(
-            //     "dispatch_send before_scan rank=%u block=%u thread=%u i=%u warp=%u lane=%u "
-            //     "tokens_per_expert=%u expert_offset=%u\n",
-            //     (unsigned)rank,
-            //     (unsigned)blockIdx.x,
-            //     (unsigned)threadIdx.x,
-            //     (unsigned)i,
-            //     (unsigned)warp_id,
-            //     (unsigned)lane_id,
-            //     (unsigned)tokens_per_expert[i],
-            //     (unsigned)expert_offset
-            // );
+            local_num_routed[i] = expert_offset; // Number of tokens routed to this expert from this rank.
         }
         __syncthreads();
         if (threadIdx.x == 0) {
@@ -233,21 +235,6 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
             expert_sums[warp_id] = expert_offset;
         }
         __syncthreads();
-        // if (i < num_experts) {
-        //     printf(
-        //         "dispatch_send after_warp_scan rank=%u block=%u thread=%u i=%u warp=%u lane=%u "
-        //         "tokens_per_expert=%u expert_offset=%u expert_sum=%u\n",
-        //         (unsigned)rank,
-        //         (unsigned)blockIdx.x,
-        //         (unsigned)threadIdx.x,
-        //         (unsigned)i,
-        //         (unsigned)warp_id,
-        //         (unsigned)lane_id,
-        //         (unsigned)tokens_per_expert[i],
-        //         (unsigned)expert_offset,
-        //         (unsigned)expert_sums[warp_id]
-        //     );
-        // }
 
         // Sum up the warp sums in the first warp.
         if (warp_id == 0) {
@@ -333,6 +320,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
 
                         // If the destination is within the same node, write using NVLink.
                         if (dst_node == node_rank && dst_rank != rank && route.offset < max_private_tokens) {
+                            // If we are in the same DP group, we can write directly to the peer's private recv buffer using NVLink. (We only write to the rank that is in the same lane as me in the other DP group as we use node_group (= rank / dp_size) to position our self in the buffer. And the idea is that ranks in the same DP group will have the same information)
                             if (dst_rank % dp_size == rank % dp_size) {
                                 // Write to the private recv buffer directly using NVLink.
                                 const uint32_t local_peer = dst_rank % NODE_SIZE;
@@ -440,7 +428,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
 
                     // If the destination is within the same node, write using NVLink.
                     if (dst_node == node_rank && dst_rank != rank && route.offset < max_private_tokens) {
-                        // Write to the private recv buffer directly using NVLink.
+                        // Write to the private recv buffer of the peer gpu directly using NVLink.
                         const uint32_t local_peer = dst_rank % NODE_SIZE;
                         std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
                         uint4 *x_token_dst = (uint4*)token_ptr;
@@ -558,12 +546,12 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     #pragma unroll
                     for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
                         auto route = expert_iterator[e];
-                        const uint32_t dst_rank = route.expert / experts_per_rank;
+                        const uint32_t dst_rank = route.expert / experts_per_rank; // local index of experts dst rank.
                         const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                         // If the destination is within the same node, write using NVLink.
                         if (dst_node == node_rank && dst_rank != rank && route.offset < max_private_tokens) {
-                            // If we are in the same DP group, we can write directly to the peer's private recv buffer using NVLink.
+                            // Write to rank that has same lane as me in the other dp group using NVlink.
                             if (dst_rank % dp_size == rank % dp_size) {
                                 // Write to the private recv buffer directly using NVLink.
                                 const uint32_t local_peer = dst_rank % NODE_SIZE;
@@ -749,16 +737,16 @@ int a2a_kernels::a2a_dispatch_send(
                     num_experts * sizeof(uint32_t),
                     cudaMemcpyDeviceToHost
                 );
-                if (status == cudaSuccess) {
-                    std::printf(
-                        "dispatch_send launcher_after_stream_sync rank=%u expert_offsets=",
-                        (unsigned)rank
-                    );
-                    for (size_t i = 0; i < num_experts; ++i) {
-                        std::printf("%s%u", i == 0 ? "[" : ", ", (unsigned)host_expert_offsets[i]);
-                    }
-                    std::printf("]\n");
-                }
+                // if (status == cudaSuccess) {
+                //     std::printf(
+                //         "dispatch_send launcher_after_stream_sync rank=%u expert_offsets=",
+                //         (unsigned)rank
+                //     );
+                //     for (size_t i = 0; i < num_experts; ++i) {
+                //         std::printf("%s%u", i == 0 ? "[" : ", ", (unsigned)host_expert_offsets[i]);
+                //     }
+                //     std::printf("]\n");
+                // }
             }
         }
     }

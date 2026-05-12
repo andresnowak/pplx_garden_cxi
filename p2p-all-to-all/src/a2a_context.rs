@@ -138,6 +138,14 @@ pub struct AllToAllContext {
 }
 
 impl AllToAllContext {
+    fn debug_dispatch_offsets_enabled() -> bool {
+        env::var("PPLX_DEBUG_DISPATCH_OFFSETS").ok().as_deref() == Some("1")
+    }
+
+    fn debug_dispatch_memory_ranges_enabled() -> bool {
+        env::var("PPLX_DEBUG_DISPATCH_MEMORY_RANGES").ok().as_deref() == Some("1")
+    }
+
     fn debug_sync_dispatch_stream(stream: u64) -> Result<()> {
         if env::var("PPLX_DEBUG_SYNC_DISPATCH_SEND").ok().as_deref() != Some("1") {
             return Ok(());
@@ -156,6 +164,10 @@ impl AllToAllContext {
     }
 
     fn debug_print_dispatch_memory_ranges(&self, label: &str) {
+        if !Self::debug_dispatch_memory_ranges_enabled() {
+            return;
+        }
+
         let expert_offsets_ptr = self.workspace.expert_offsets.ptr().as_ptr() as usize;
         let expert_offsets_size = self.workspace.expert_offsets.size();
         let token_offset_ptr = self.workspace.token_offset.ptr().as_ptr() as usize;
@@ -395,6 +407,10 @@ impl AllToAllContext {
         )?;
 
         let num_blocks = cudaGetNumSMs(device)?;
+        println!(
+            "AllToAllContext initialized for cuda:{} with num_blocks={} max_num_tokens={} num_experts={} num_experts_per_token={} max_private_tokens={}",
+            device, num_blocks, max_num_tokens, num_experts, num_experts_per_token, max_private_tokens
+        );
 
         // Build the context.
         Ok(Self {
@@ -573,14 +589,16 @@ impl AllToAllContext {
 
         Self::debug_sync_dispatch_stream(stream)?;
 
-        let expert_offsets = self.workspace.expert_offsets.to_vec::<u32>()?;
-        let token_offset = self.workspace.token_offset.to_vec::<u32>()?;
-        println!(
-            "dispatch_send debug after_stream_sync rank={} expert_offsets={:?} token_offset_prefix={:?}",
-            self.rank,
-            &expert_offsets[..expert_offsets.len().min(16)],
-            &token_offset[..token_offset.len().min(16)],
-        );
+        if Self::debug_dispatch_offsets_enabled() {
+            let expert_offsets = self.workspace.expert_offsets.to_vec::<u32>()?;
+            let token_offset = self.workspace.token_offset.to_vec::<u32>()?;
+            println!(
+                "dispatch_send debug after_stream_sync rank={} expert_offsets={:?} token_offset_prefix={:?}",
+                self.rank,
+                &expert_offsets[..expert_offsets.len().min(16)],
+                &token_offset[..token_offset.len().min(16)],
+            );
+        }
 
         if self.worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));
@@ -643,15 +661,17 @@ impl AllToAllContext {
             return Err(anyhow!("fabric-lib transfer error"));
         }
 
-        let expert_offsets = self.workspace.expert_offsets.to_vec::<u32>()?;
-        let token_offset = self.workspace.token_offset.to_vec::<u32>()?;
         self.debug_print_dispatch_memory_ranges("after_dispatch_recv");
-        println!(
-            "dispatch_recv debug rank={} expert_offsets={:?} token_offset_prefix={:?}",
-            self.rank,
-            &expert_offsets[..expert_offsets.len().min(16)],
-            &token_offset[..token_offset.len().min(16)],
-        );
+        if Self::debug_dispatch_offsets_enabled() {
+            let expert_offsets = self.workspace.expert_offsets.to_vec::<u32>()?;
+            let token_offset = self.workspace.token_offset.to_vec::<u32>()?;
+            println!(
+                "dispatch_recv debug rank={} expert_offsets={:?} token_offset_prefix={:?}",
+                self.rank,
+                &expert_offsets[..expert_offsets.len().min(16)],
+                &token_offset[..token_offset.len().min(16)],
+            );
+        }
 
         Ok(())
     }
