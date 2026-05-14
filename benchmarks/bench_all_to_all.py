@@ -181,8 +181,16 @@ class AllToAllResource:
                 device=device,
             )
 
+    def local_expert_range(self) -> tuple[int, int]:
+        first_expert = self.global_group.rank * self.num_local_experts
+        last_expert = min(first_expert + self.num_local_experts, self.cfg.num_experts)
+        return first_expert, last_expert
+
     def create_rank_data(self, dp_rank: int) -> RankTestData:
         return RankTestData.create(
+            dp_rank=dp_rank,
+            dp_size=self.dp_group.size,
+            world_size=self.global_group.size,
             num_experts=self.cfg.num_experts,
             num_experts_per_token=self.cfg.num_experts_per_token,
             max_num_tokens=self.cfg.max_num_tokens,
@@ -289,6 +297,11 @@ def correctness_check(r: AllToAllResource) -> None:
 def benchmark(
     r: AllToAllResource, num_warmup: int, num_repeats: int, output: Path
 ) -> None:
+    assert r.dp_group.size == 1, (
+        "The all-gather + reduce-scatter baseline is currently only implemented "
+        "for dp_size == 1"
+    )
+
     local_rank = r.create_rank_data(r.dp_rank)
     rng = make_rng(r.device, r.dp_rank)
     out_dummy = torch.empty((1,), dtype=torch.float32, device=r.device)
@@ -329,6 +342,110 @@ def benchmark(
             do_recv=do_recv,
         )
 
+    def baseline_dispatch() -> tuple[torch.Tensor, torch.Tensor, int]:
+        # Mirror Megatron's all-gather dispatcher:
+        # gather tokens / routing metadata globally, then locally filter the
+        # tokens that belong to this rank's experts and pack them contiguously.
+        gathered_x = r.global_group.all_gather(local_rank.dp_x, dim=0).view(
+            r.global_group.size, r.cfg.max_num_tokens, r.cfg.hidden_dim
+        )
+        gathered_indices = r.global_group.all_gather(
+            local_rank.indices.to(torch.int32), dim=0
+        ).view(
+            r.global_group.size,
+            r.cfg.max_num_tokens,
+            r.cfg.num_experts_per_token,
+        )
+        gathered_weights = r.global_group.all_gather(local_rank.weights, dim=0).view(
+            r.global_group.size,
+            r.cfg.max_num_tokens,
+            r.cfg.num_experts_per_token,
+        )
+
+        if local_rank.dp_x_scale is not None:
+            assert r.cfg.hidden_dim_scale is not None
+            gathered_x_scale = r.global_group.all_gather(
+                local_rank.dp_x_scale, dim=0
+            ).view(
+                r.global_group.size,
+                r.cfg.max_num_tokens,
+                r.cfg.hidden_dim_scale,
+            )
+        else:
+            gathered_x_scale = None
+
+        first_expert, last_expert = r.local_expert_range()
+
+        flat_x = gathered_x.view(-1, r.cfg.hidden_dim)
+        flat_indices = gathered_indices.view(-1, r.cfg.num_experts_per_token)
+        flat_weights = gathered_weights.view(-1, r.cfg.num_experts_per_token)
+        local_mask = (flat_indices >= first_expert) & (flat_indices < last_expert)
+
+        row_index = torch.arange(flat_indices.shape[0], device=r.device).unsqueeze(1)
+        row_index = row_index.expand(-1, r.cfg.num_experts_per_token)
+        selected_rows = row_index[local_mask]
+        selected_experts = (flat_indices[local_mask] - first_expert).to(torch.int64)
+        selected_weights = flat_weights[local_mask].to(r.cfg.out_dtype)
+
+        counts = torch.bincount(
+            selected_experts,
+            minlength=r.num_local_experts,
+        ).to(torch.int32)
+        r.expert_num_tokens.zero_()
+        r.expert_num_tokens[: counts.numel()] = counts
+        r.out_expert_x.zero_()
+        if r.out_expert_x_scale is not None:
+            r.out_expert_x_scale.zero_()
+
+        if selected_rows.numel() == 0:
+            return selected_rows, selected_weights, flat_indices.shape[0]
+
+        order = torch.argsort(selected_experts, stable=True)
+        packed_rows = selected_rows[order]
+        packed_weights = selected_weights[order]
+        packed_x = flat_x[packed_rows]
+        r.out_expert_x[: packed_x.shape[0]].copy_(packed_x)
+
+        if gathered_x_scale is not None and r.out_expert_x_scale is not None:
+            flat_x_scale = gathered_x_scale.view(-1, gathered_x_scale.shape[-1])
+            packed_x_scale = flat_x_scale[packed_rows]
+            r.out_expert_x_scale[: packed_x_scale.shape[0]].copy_(packed_x_scale)
+
+        return packed_rows, packed_weights, flat_indices.shape[0]
+
+    def baseline_combine(
+        packed_rows: torch.Tensor,
+        packed_weights: torch.Tensor,
+        num_global_tokens: int,
+    ) -> None:
+        # Mirror Megatron's combine path:
+        # local expert outputs are unpermuted back to a global-token layout,
+        # then reduced and scattered back to the original token shard.
+        expert_y = act(r.out_expert_x, r.out_expert_x_scale).to(r.cfg.out_dtype)
+        flat_contrib = torch.zeros(
+            (num_global_tokens, r.cfg.hidden_dim),
+            dtype=r.cfg.out_dtype,
+            device=r.device,
+        )
+
+        if packed_rows.numel() > 0:
+            flat_contrib.index_add_(
+                0,
+                packed_rows,
+                expert_y[: packed_rows.numel()] * packed_weights.unsqueeze(-1),
+            )
+
+        local_contrib = flat_contrib.view(
+            r.global_group.size, r.cfg.max_num_tokens, r.cfg.hidden_dim
+        )
+
+        reduce_scatter_input = local_contrib.contiguous()
+        torch.distributed.reduce_scatter_tensor(
+            r.out_tokens,
+            reduce_scatter_input,
+            group=r.global_group._device_group,
+        )
+
     # Create and initialize events for timing.
     events = []
     for _ in range(num_warmup + num_repeats):
@@ -344,6 +461,10 @@ def benchmark(
         combine_send_end = torch.cuda.Event(enable_timing=True)
         combine_recv_start = torch.cuda.Event(enable_timing=True)
         combine_recv_end = torch.cuda.Event(enable_timing=True)
+        baseline_dispatch_start = torch.cuda.Event(enable_timing=True)
+        baseline_dispatch_end = torch.cuda.Event(enable_timing=True)
+        baseline_combine_start = torch.cuda.Event(enable_timing=True)
+        baseline_combine_end = torch.cuda.Event(enable_timing=True)
         dispatch_start.record()
         dispatch_end.record()
         combine_start.record()
@@ -356,6 +477,10 @@ def benchmark(
         combine_send_end.record()
         combine_recv_start.record()
         combine_recv_end.record()
+        baseline_dispatch_start.record()
+        baseline_dispatch_end.record()
+        baseline_combine_start.record()
+        baseline_combine_end.record()
         events.append(
             (
                 dispatch_start,
@@ -370,6 +495,10 @@ def benchmark(
                 combine_send_end,
                 combine_recv_start,
                 combine_recv_end,
+                baseline_dispatch_start,
+                baseline_dispatch_end,
+                baseline_combine_start,
+                baseline_combine_end,
             )
         )
 
@@ -397,6 +526,10 @@ def benchmark(
             combine_send_end,
             combine_recv_start,
             combine_recv_end,
+            baseline_dispatch_start,
+            baseline_dispatch_end,
+            baseline_combine_start,
+            baseline_combine_end,
         ) = events[i]
 
 
@@ -451,6 +584,23 @@ def benchmark(
             combine(do_send=False, do_recv=True)
             combine_recv_end.record()
 
+        with profile_range("all-gather-reduce-scatter-baseline"):
+            wait()
+
+            baseline_dispatch_start.record()
+            packed_rows, packed_weights, num_global_tokens = baseline_dispatch()
+            baseline_dispatch_end.record()
+
+            wait()
+
+            baseline_combine_start.record()
+            baseline_combine(
+                packed_rows,
+                packed_weights,
+                num_global_tokens,
+            )
+            baseline_combine_end.record()
+
 
     torch.cuda.synchronize()
     torch.cuda.profiler.stop()
@@ -462,6 +612,8 @@ def benchmark(
     combine_times: list[float] = []
     combine_send_times: list[float] = []
     combine_recv_times: list[float] = []
+    baseline_dispatch_times: list[float] = []
+    baseline_combine_times: list[float] = []
     for (
         dispatch_st,
         dispatch_en,
@@ -475,6 +627,10 @@ def benchmark(
         combine_send_en,
         combine_recv_st,
         combine_recv_en,
+        baseline_dispatch_st,
+        baseline_dispatch_en,
+        baseline_combine_st,
+        baseline_combine_en,
     ) in events[num_warmup:]:
         dispatch_times.append(dispatch_st.elapsed_time(dispatch_en) * 1000)
         combine_times.append(combine_st.elapsed_time(combine_en) * 1000)
@@ -486,6 +642,12 @@ def benchmark(
         )
         combine_send_times.append(combine_send_st.elapsed_time(combine_send_en) * 1000)
         combine_recv_times.append(combine_recv_st.elapsed_time(combine_recv_en) * 1000)
+        baseline_dispatch_times.append(
+            baseline_dispatch_st.elapsed_time(baseline_dispatch_en) * 1000
+        )
+        baseline_combine_times.append(
+            baseline_combine_st.elapsed_time(baseline_combine_en) * 1000
+        )
 
 
     # All-gather results from all ranks
@@ -495,15 +657,24 @@ def benchmark(
     dispatch_recv_times = sum(r.global_group.all_gather_object(dispatch_recv_times), [])
     combine_send_times = sum(r.global_group.all_gather_object(combine_send_times), [])
     combine_recv_times = sum(r.global_group.all_gather_object(combine_recv_times), [])
+    baseline_dispatch_times = sum(
+        r.global_group.all_gather_object(baseline_dispatch_times), []
+    )
+    baseline_combine_times = sum(
+        r.global_group.all_gather_object(baseline_combine_times), []
+    )
 
     # Report the results.
     if r.global_group.rank == 0:
+        output.parent.mkdir(parents=True, exist_ok=True)
         stat_dispatch = Statistics.create(dispatch_times)
         stat_dispatch_send = Statistics.create(dispatch_send_times)
         stat_dispatch_recv = Statistics.create(dispatch_recv_times)
         stat_combine = Statistics.create(combine_times)
         stat_combine_send = Statistics.create(combine_send_times)
         stat_combine_recv = Statistics.create(combine_recv_times)
+        stat_baseline_dispatch = Statistics.create(baseline_dispatch_times)
+        stat_baseline_combine = Statistics.create(baseline_combine_times)
 
         dispatch_bandwidth = r.cfg.dispatch_bytes / stat_dispatch.p50 * 1e-3
         combine_bandwidth = r.cfg.combine_bytes / stat_combine.p50 * 1e-3
@@ -515,6 +686,7 @@ def benchmark(
         )
         logger.info("Dispatch send time: %s", stat_dispatch_send)
         logger.info("Dispatch recv time: %s", stat_dispatch_recv)
+        logger.info("Baseline dispatch time: %s", stat_baseline_dispatch)
 
         logger.info(
             "Combine both time: %s, %.1f GB/s",
@@ -523,17 +695,28 @@ def benchmark(
         )
         logger.info("Combine send time: %s", stat_combine_send)
         logger.info("Combine recv time: %s", stat_combine_recv)
+        logger.info("Baseline combine time: %s", stat_baseline_combine)
 
         data = {
-            "dispatch": {
-                "both": asdict(stat_dispatch),
-                "send": asdict(stat_dispatch_send),
-                "recv": asdict(stat_dispatch_recv),
+            "a2a": {
+                "dispatch": {
+                    "both": asdict(stat_dispatch),
+                    "send": asdict(stat_dispatch_send),
+                    "recv": asdict(stat_dispatch_recv),
+                },
+                "combine": {
+                    "both": asdict(stat_combine),
+                    "send": asdict(stat_combine_send),
+                    "recv": asdict(stat_combine_recv),
+                },
             },
-            "combine": {
-                "both": asdict(stat_combine),
-                "send": asdict(stat_combine_send),
-                "recv": asdict(stat_combine_recv),
+            "baseline": {
+                "dispatch": {
+                    "both": asdict(stat_baseline_dispatch),
+                },
+                "combine": {
+                    "both": asdict(stat_baseline_combine),
+                },
             },
         }
 
