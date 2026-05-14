@@ -633,6 +633,7 @@ int a2a_kernels::a2a_dispatch_send(
     assert(world_size <= NUM_THREADS);
     assert(num_experts <= NUM_THREADS);
 
+    nvtxRangePush("dispatch_send_setup");
     const size_t token_dim = round_up<size_t>(hidden_dim * x_elemsize, sizeof(int4));
     const size_t token_scale_dim = round_up<size_t>(hidden_dim_scale * x_scale_elemsize, sizeof(int4));
     // Reserve a 16-byte trailer on every routed token slot for dispatch metadata.
@@ -679,6 +680,7 @@ int a2a_kernels::a2a_dispatch_send(
     };
 
     const size_t shared_memory_send = std::max(num_experts, NUM_WARPS) * sizeof(uint32_t);
+    nvtxRangePop(); // dispatch_send_setup
 
     nvtxRangePush("dispatch_send");
     cudaError_t status;
@@ -687,6 +689,7 @@ int a2a_kernels::a2a_dispatch_send(
             LAUNCH_HIDDEN_DIM_SCALE(hidden_dim_scale, HiddenDimScale, {
                 LAUNCH_WORLD_SIZE(node_size, NODE_SIZE, {
                     if (num_blocks >= num_tokens) {
+                        nvtxRangePush("dispatch_send_kernel_quick");
                         status = cudaLaunchCooperativeKernel(
                             (void *)&a2a_dispatch_send_kernel<
                                 true,
@@ -702,7 +705,9 @@ int a2a_kernels::a2a_dispatch_send(
                             shared_memory_send,
                             (cudaStream_t)stream
                         );
+                        nvtxRangePop(); // dispatch_send_kernel_quick
                     } else {
+                        nvtxRangePush("dispatch_send_kernel_slow");
                         status = cudaLaunchCooperativeKernel(
                             (void *)&a2a_dispatch_send_kernel<
                                 false,
@@ -718,6 +723,7 @@ int a2a_kernels::a2a_dispatch_send(
                             shared_memory_send,
                             (cudaStream_t)stream
                         );
+                        nvtxRangePop(); // dispatch_send_kernel_slow
                     }
                 });
             });
@@ -725,31 +731,33 @@ int a2a_kernels::a2a_dispatch_send(
     });
     nvtxRangePop();
 
-    if (status == cudaSuccess) {
-        const char *debug_sync = std::getenv("PPLX_DEBUG_LAUNCHER_DISPATCH_SEND");
-        if (debug_sync && debug_sync[0] == '1' && debug_sync[1] == '\0') {
-            status = cudaStreamSynchronize((cudaStream_t)stream);
-            if (status == cudaSuccess) {
-                std::vector<uint32_t> host_expert_offsets(num_experts, 0);
-                status = cudaMemcpy(
-                    host_expert_offsets.data(),
-                    expert_offsets,
-                    num_experts * sizeof(uint32_t),
-                    cudaMemcpyDeviceToHost
-                );
-                // if (status == cudaSuccess) {
-                //     std::printf(
-                //         "dispatch_send launcher_after_stream_sync rank=%u expert_offsets=",
-                //         (unsigned)rank
-                //     );
-                //     for (size_t i = 0; i < num_experts; ++i) {
-                //         std::printf("%s%u", i == 0 ? "[" : ", ", (unsigned)host_expert_offsets[i]);
-                //     }
-                //     std::printf("]\n");
-                // }
-            }
-        }
-    }
+    // if (status == cudaSuccess) {
+    //     const char *debug_sync = std::getenv("PPLX_DEBUG_LAUNCHER_DISPATCH_SEND");
+    //     if (debug_sync && debug_sync[0] == '1' && debug_sync[1] == '\0') {
+    //         nvtxRangePush("dispatch_send_debug_sync");
+    //         status = cudaStreamSynchronize((cudaStream_t)stream);
+    //         if (status == cudaSuccess) {
+    //             std::vector<uint32_t> host_expert_offsets(num_experts, 0);
+    //             status = cudaMemcpy(
+    //                 host_expert_offsets.data(),
+    //                 expert_offsets,
+    //                 num_experts * sizeof(uint32_t),
+    //                 cudaMemcpyDeviceToHost
+    //             );
+    //             // if (status == cudaSuccess) {
+    //             //     std::printf(
+    //             //         "dispatch_send launcher_after_stream_sync rank=%u expert_offsets=",
+    //             //         (unsigned)rank
+    //             //     );
+    //             //     for (size_t i = 0; i < num_experts; ++i) {
+    //             //         std::printf("%s%u", i == 0 ? "[" : ", ", (unsigned)host_expert_offsets[i]);
+    //             //     }
+    //             //     std::printf("]\n");
+    //             // }
+    //         }
+    //         nvtxRangePop(); // dispatch_send_debug_sync
+    //     }
+    // }
 
     return status;
 }

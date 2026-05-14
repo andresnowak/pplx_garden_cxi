@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 #include <cassert>
 
+// NOTE: Only when num_tokens_per_expert = 8
 template <size_t V>
 class Fixed {
 public:

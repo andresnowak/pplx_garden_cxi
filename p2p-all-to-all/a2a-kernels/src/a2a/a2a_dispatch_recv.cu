@@ -296,6 +296,7 @@ int a2a_kernels::a2a_dispatch_recv(
     dim3 dimGrid(num_blocks, 1, 1);
     dim3 dimBlock(NUM_WARPS * WARP_SIZE, 1, 1);
 
+    nvtxRangePush("dispatch_recv_setup");
     const size_t token_dim = round_up<size_t>(hidden_dim * x_elemsize, sizeof(float4));
     const size_t token_scale_dim = round_up<size_t>(hidden_dim_scale * x_scale_elemsize, sizeof(float4));
     // Match the 16-byte dispatch metadata trailer added by dispatch_send.
@@ -336,12 +337,14 @@ int a2a_kernels::a2a_dispatch_recv(
         &sync_ptrs,
         &send_ptrs,
     };
+    nvtxRangePop(); // dispatch_recv_setup
 
     nvtxRangePush("dispatch_recv");
     cudaError_t status;
     LAUNCH_WORLD_SIZE(node_size, NODE_SIZE, {
         LAUNCH_TOKEN_DIM_DISPATCH(token_dim, TokenDim, {
             LAUNCH_HIDDEN_DIM_SCALE(hidden_dim_scale, HiddenDimScale, {
+                nvtxRangePush("dispatch_recv_kernel_launch");
                 status = cudaLaunchCooperativeKernel(
                     (void *)&a2a_dispatch_recv_kernel<NUM_WARPS, NODE_SIZE, TokenDim, HiddenDimScale>,
                     dimGrid,
@@ -350,6 +353,7 @@ int a2a_kernels::a2a_dispatch_recv(
                     0,
                     (cudaStream_t)stream
                 );
+                nvtxRangePop(); // dispatch_recv_kernel_launch
             });
         });
     });
