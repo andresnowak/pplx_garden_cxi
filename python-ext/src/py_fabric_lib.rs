@@ -14,9 +14,9 @@ use fabric_lib::{
     SendRecvEngine, TopologyGroup, TransferCallback, TransferEngine,
     TransferEngineBuilder, UvmWatcherCallback,
     api::{
-        DomainAddress, DomainGroupRouting, ImmTransferRequest, MemoryRegionDescriptor,
-        MemoryRegionHandle, PagedTransferRequest, SingleTransferRequest,
-        TransferRequest,
+        DomainAddress, DomainGroupRouting, GroupTransferRouting, ImmTransferRequest,
+        MemoryRegionDescriptor, MemoryRegionHandle, PagedTransferRequest,
+        ScatterTarget, ScatterTransferRequest, SingleTransferRequest, TransferRequest,
     },
     detect_topology,
 };
@@ -84,6 +84,27 @@ impl PyPageIndices {
     #[new]
     fn new(indices: Vec<u32>) -> Self {
         PyPageIndices(Arc::new(indices))
+    }
+}
+
+#[pyclass(name = "ScatterTarget", module = "pplx_garden._rust")]
+#[derive(Clone)]
+pub struct PyScatterTarget {
+    #[pyo3(get, set)]
+    pub dst_mr: PyMemoryRegionDescriptor,
+    #[pyo3(get, set)]
+    pub length: u64,
+    #[pyo3(get, set)]
+    pub src_offset: u64,
+    #[pyo3(get, set)]
+    pub dst_offset: u64,
+}
+
+#[pymethods]
+impl PyScatterTarget {
+    #[new]
+    fn new(dst_mr: PyMemoryRegionDescriptor, length: u64, src_offset: u64, dst_offset: u64) -> Self {
+        PyScatterTarget { dst_mr, length, src_offset, dst_offset }
     }
 }
 
@@ -711,6 +732,44 @@ impl PyTransferEngine {
         })
     }
 
+    fn submit_scatter_writes<'py>(
+        &self,
+        py: Python<'py>,
+        src_mr: PyMemoryRegionHandle,
+        dsts: Vec<PyScatterTarget>,
+        imm_data: Option<u32>,
+        on_done: Py<PyAny>,
+        on_error: Py<PyAny>,
+    ) -> PyResult<()> {
+        let dsts: Vec<ScatterTarget> = dsts
+            .into_iter()
+            .map(|d| ScatterTarget {
+                dst_mr: d.dst_mr.0,
+                length: d.length,
+                src_offset: d.src_offset,
+                dst_offset: d.dst_offset,
+            })
+            .collect();
+
+        let scatter_op = ScatterTransferRequest {
+            src_mr: src_mr.0,
+            dst_handle: None,
+            dsts: Arc::new(dsts),
+            imm_data,
+            domain: GroupTransferRouting::AllDomainsShardBytes,
+        };
+
+        let callback = make_transfer_callback(on_done, on_error);
+
+        Python::detach(py, || {
+            self.engine
+                .submit_transfer(TransferRequest::Scatter(scatter_op), callback)
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to submit scatter writes: {}", e))
+                })
+        })
+    }
+
     fn stop(&self) {
         self.engine.stop();
     }
@@ -726,6 +785,7 @@ pub fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTransferEngine>()?;
     m.add_class::<PyTransferEngineBuilder>()?;
     m.add_class::<PyPageIndices>()?;
+    m.add_class::<PyScatterTarget>()?;
     m.add_class::<PyDomainAddress>()?;
     m.add_class::<PyMemoryRegionHandle>()?;
     m.add_class::<PyMemoryRegionDescriptor>()?;

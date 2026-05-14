@@ -45,6 +45,19 @@ class MemoryRegionDescriptor:
 class PageIndices:
     def __init__(self, indices: Sequence[int]) -> None: ...
 
+class ScatterTarget:
+    dst_mr: MemoryRegionDescriptor
+    length: int
+    src_offset: int
+    dst_offset: int
+    def __init__(
+        self,
+        dst_mr: MemoryRegionDescriptor,
+        length: int,
+        src_offset: int,
+        dst_offset: int,
+    ) -> None: ...
+
 class UvmWatcher:
     @property
     def ptr(self) -> int: ...
@@ -186,3 +199,16 @@ class TransferEngine:
         on_done: Callable[[], None],
         on_error: Callable[[str], None],
     ) -> None: ...
+    def submit_scatter_writes(
+        self,
+        src_mr: MemoryRegionHandle,
+        dsts: list[ScatterTarget],
+        imm_data: int | None,
+        on_done: Callable[[], None],
+        on_error: Callable[[str], None],
+    ) -> None:
+        """
+        Scatter-write src_mr to multiple destinations simultaneously.
+        Uses AllDomainsShardBytes routing (all NICs share the byte-level load).
+        If imm_data is provided, each destination receives it as a completion signal.
+        """
