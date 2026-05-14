@@ -1,0 +1,17 @@
+image="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/apertus-2:alps4-dev-3f34f16a8d1f2fc0"
+
+mounts = [
+    "${SCRATCH}:${SCRATCH}",
+    "${HOME}:${HOME}",
+    "/capstor:/capstor"
+]
+
+workdir = "${PWD}"
+
+writable = true
+
+[env]
+PMIX_MCA_psec = "native"
+
+[annotations]
+com.hooks.cxi.enabled = "false"
