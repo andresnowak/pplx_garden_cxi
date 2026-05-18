@@ -326,7 +326,7 @@ impl AllToAllContext {
             .enumerate()
             .map(|(i, peer)| format!("Rank#{} Peer#{}: {}", rank, i, peer.address))
             .collect::<Vec<String>>()
-            .join("---");  // 用换行符连接
+            .join("---");  // Join with separators
         println!("{}", output);
         */
         let worker: Arc<WorkerState> = Arc::new(WorkerState::new(

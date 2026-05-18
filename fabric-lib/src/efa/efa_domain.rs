@@ -373,9 +373,9 @@ impl EfaDomain {
             let mr_fid = &raw mut (*mr.as_ptr()).fid;
             let fi_mr_bind = (*(*mr_fid).ops).bind.unwrap_unchecked();
             fi_mr_bind(
-                mr_fid,  // 这是 &mr->fid，类型是 *mut fid
-                &raw mut (*self.ep.as_ptr()).fid,  // 第二个参数是 *mut fid
-                0,  // 标志位
+                mr_fid,  // This is &mr->fid, type *mut fid
+                &raw mut (*self.ep.as_ptr()).fid,  // The second argument is *mut fid
+                0,  // Flags
                 )
         };
         if ret != 0 {
@@ -386,9 +386,9 @@ impl EfaDomain {
             let mr_fid = &raw mut (*mr.as_ptr()).fid;
             let fi_control = (*(*mr_fid).ops).control.unwrap_unchecked();
             fi_control(
-                mr_fid,  // 这是 &mr->fid，类型是 *mut fid
-                FI_ENABLE as i32,  // 命令
-                null_mut(),  // 参数
+                mr_fid,  // This is &mr->fid, type *mut fid
+                FI_ENABLE as i32,  // Command
+                null_mut(),  // Argument
             )
         };
         if ret != 0 {

@@ -240,7 +240,7 @@ fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
 fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
     let mut numa_cpus = Vec::new();
     
-    // 首先尝试从 /sys/devices/system/node 获取 NUMA 信息
+    // First try to get NUMA information from /sys/devices/system/node
     let mut has_numa_nodes = false;
     
     for entry in std::fs::read_dir("/sys/devices/system/node").map_err(|_| {
@@ -283,13 +283,13 @@ fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
         numa_cpus[numa_idx] = cpus;
     }
     
-    // 如果系统支持 NUMA，直接返回结果
+    // If the system supports NUMA, return the result directly
     if has_numa_nodes && !numa_cpus.is_empty() {
         return Ok(numa_cpus);
     }
     
-    // ARM 系统通常没有 NUMA 或者只有一个 NUMA 节点
-    // 从 /proc/cpuinfo 获取所有逻辑 CPU
+    // ARM systems usually have no NUMA support or only one NUMA node
+    // Get all logical CPUs from /proc/cpuinfo
     let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
         .map_err(|_| FabricLibError::Custom("Failed to read /proc/cpuinfo"))?;
     
@@ -306,18 +306,18 @@ fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
         }
     }
     
-    // 排序去重
+    // Sort and deduplicate
     cpus.sort_unstable();
     cpus.dedup();
     
     if cpus.is_empty() {
-        // 回退方案：从 /sys/devices/system/cpu 获取
+        // Fallback: get CPU information from /sys/devices/system/cpu
         match std::fs::read_to_string("/sys/devices/system/cpu/online") {
             Ok(online_cpus) => {
                 cpus = parse_comma_dash_int_list(&online_cpus);
             }
             Err(_) => {
-                // 最后尝试：通过 lscpu 命令获取 CPU 数
+                // Last attempt: get the CPU count with the nproc command
                 let output = std::process::Command::new("nproc")
                     .output()
                     .map_err(|_| FabricLibError::Custom("Failed to execute nproc"))?;
@@ -333,7 +333,7 @@ fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
         return Err(FabricLibError::Custom("Failed to detect any CPUs"));
     }
     
-    // ARM 系统通常只有一个 NUMA 节点
+    // ARM systems usually have only one NUMA node
     Ok(vec![cpus])
 }
 */
@@ -342,7 +342,7 @@ fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
     let mut numa_cpus_map = std::collections::HashMap::new();
     let mut max_node = 0;
     
-    // 遍历所有 NUMA 节点目录
+    // Iterate over all NUMA node directories
     for entry in std::fs::read_dir("/sys/devices/system/node").map_err(|_| {
         FabricLibError::Custom("Failed to read /sys/devices/system/node")
     })? {
@@ -371,7 +371,7 @@ fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
         let cpulist_path = path.join("cpulist");
         let cpulist = match std::fs::read_to_string(&cpulist_path) {
             Ok(content) => content,
-            Err(_) => continue, // 跳过无法读取的节点
+            Err(_) => continue, // Skip nodes that cannot be read
         };
         
         let cpus = parse_comma_dash_int_list(&cpulist);
@@ -380,33 +380,33 @@ fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
         }
     }
     
-    // 如果找到了 NUMA 节点
+    // If NUMA nodes were found
     if !numa_cpus_map.is_empty() {
-        // 创建向量，只包含有 CPU 的节点
+        // Create a vector containing only nodes that have CPUs
         let mut numa_cpus = Vec::new();
         for node_id in 0..=max_node {
             if let Some(cpus) = numa_cpus_map.get(&node_id) {
                 numa_cpus.push(cpus.clone());
             } else {
-                // 只添加有 CPU 的节点，空节点不添加
-                // 这样后续代码就不会访问到空节点
+                // Only add nodes that have CPUs; do not add empty nodes
+                // This prevents later code from accessing empty nodes
             }
         }
         
-        // 如果没有节点有 CPU，回退到单节点
+        // If no nodes have CPUs, fall back to a single node
         if numa_cpus.is_empty() {
             get_fallback_cpus()
         } else {
             Ok(numa_cpus)
         }
     } else {
-        // 没有找到 NUMA 节点，回退
+        // No NUMA nodes were found; fall back
         get_fallback_cpus()
     }
 }
 
 fn get_fallback_cpus() -> Result<Vec<Vec<u16>>> {
-    // 从 /proc/cpuinfo 获取所有 CPU
+    // Get all CPUs from /proc/cpuinfo
     let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
         .map_err(|_| FabricLibError::Custom("Failed to read /proc/cpuinfo"))?;
     
@@ -428,7 +428,7 @@ fn get_fallback_cpus() -> Result<Vec<Vec<u16>>> {
     if cpus.is_empty() {
         Err(FabricLibError::Custom("Failed to detect any CPUs"))
     } else {
-        // 将所有 CPU 放在一个节点中
+        // Put all CPUs into a single node
         Ok(vec![cpus])
     }
 }
